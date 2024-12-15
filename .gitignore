@@ -1,0 +1,10 @@
+tmp/
+temp/
+core*
+*whl
+*swp
+experiments/
+log/
+checkpoints/
+.DS_Store
+__pycache__/
