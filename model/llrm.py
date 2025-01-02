@@ -18,7 +18,12 @@ try:
 except:
     from mamba2 import Mamba2Block
 
-def _init_weights(self, m):
+try:
+    from .loss import PerceptualLoss
+except:
+    from loss import PerceptualLoss
+
+def _init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.normal_(m.weight, std=.02)
         if m.bias is not None:
@@ -62,6 +67,7 @@ class Processor(nn.Module):
                 dim_cur = dim_next
             if s == "t":
                 self.blocks.append(TransformerBlock(dim_cur, config.model.transformer.num_heads))
+                self.blocks[-1].apply(_init_weights)
             elif s == "m":
                 self.blocks.append(Mamba2Block(dim_cur, config.model.mamba2.d_state))
             else:
@@ -184,6 +190,7 @@ class LongLRM(nn.Module):
         if self.num_global_tokens > 0:
             self.global_token_init = nn.Parameter(torch.randn(1, self.num_global_tokens, self.dim_start))
         self.tokenizer = nn.Linear(input_dim * self.patch_size ** 2, self.dim_start)
+        self.tokenizer.apply(_init_weights)
         self.processor = Processor(config)
         self.tokenDecoder = nn.Sequential(
             nn.LayerNorm(self.dim_out),
@@ -192,6 +199,25 @@ class LongLRM(nn.Module):
                 bias=False,
             )
         )
+        self.tokenDecoder.apply(_init_weights)
+
+        # use DepthAnything for depth loss
+        if config.model.get("depth_loss", 0.0) > 0:
+            try:
+                from depth_anything.dpt import DepthAnything
+            except:
+                from .depth_anything.dpt import DepthAnything
+            model_configs = {
+                'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+                'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+                'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}
+            }
+            encoder = 'vits' # or 'vitb', 'vits'
+            self.depth_anything = DepthAnything(model_configs[encoder])
+            self.depth_anything.load_state_dict(torch.load(f'depth_anything/depth_anything_{encoder}14.pth'))
+
+            for param in self.depth_anything.parameters():
+                param.requires_grad = False
 
     def render(self, xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H):
         B, V, _ = test_intr.shape
@@ -222,6 +248,9 @@ class LongLRM(nn.Module):
                 input_images,
                 input_intr,
                 input_c2ws,
+                input_pos_avg_inv=None,
+                scene_scale=None,
+                scene_name=None,
                 test_images=None,
                 test_intr=None,
                 test_c2ws=None,
@@ -231,8 +260,20 @@ class LongLRM(nn.Module):
         input_images: (B, V, 3, H, W)
         input_intr: (B, V, 4), (fx, fy, cx, cy)
         input_c2ws: (B, V, 4, 4)
+        input_pos_avg_inv: (B, 4, 4)
+        scene_scale: (B)
         """
         B, V, _, H, W = input_images.shape
+
+        if input_pos_avg_inv is not None:
+            input_c2ws = input_pos_avg_inv.unsqueeze(1) @ input_c2ws # (B, V, 4, 4)
+            if test_c2ws is not None:
+                test_c2ws = input_pos_avg_inv.unsqueeze(1) @ test_c2ws
+
+        if scene_scale is not None:
+            input_c2ws[:, :, :3, 3] = input_c2ws[:, :, :3, 3] * scene_scale.reshape(B, 1, 1)
+            if test_c2ws is not None:
+                test_c2ws[:, :, :3, 3] = test_c2ws[:, :, :3, 3] * scene_scale.reshape(B, 1, 1)
 
         # Embed camera info
         ray_o = input_c2ws[:, :, :3, 3].unsqueeze(2).expand(-1, -1, H * W, -1) # (B, V, H*W, 3) # camera origin
@@ -246,7 +287,7 @@ class LongLRM(nn.Module):
         ray_d = F.normalize(ray_d, p=2, dim=-1)
         ray_d = ray_d @ input_c2ws[:, :, :3, :3].transpose(-1, -2) # (B, V, H*W, 3)
 
-        input_image_cam = torch.cat([input_images.view(B, V, 3, -1).permute(0, 1, 3, 2), 
+        input_image_cam = torch.cat([input_images.view(B, V, 3, -1).permute(0, 1, 3, 2) * 2 - 1, 
                                      torch.cross(ray_o, ray_d, dim=-1),
                                      ray_d], dim=-1) # (B, V, H*W, 9)
 
@@ -283,6 +324,16 @@ class LongLRM(nn.Module):
         if self.config.model.gaussians.get("align_to_pixel", True):
             dist = xyz.mean(dim=-1, keepdim=True).sigmoid() * self.config.model.gaussians.max_dist # (B, V*H*W, 1)
             xyz = dist * ray_d.reshape(B, -1, 3) + ray_o.reshape(B, -1, 3) # (B, V*H*W, 3)
+            # get pixel-aligned depth before pruning
+            if self.config.model.get("depth_loss", 0.0) > 0:
+                pos = xyz.reshape(B, V, H*W, 3)
+                input_w2cs = input_c2ws.float().inverse() # (B, V, 4, 4)
+                pos_cam = pos @ input_w2cs[:, :, :3, :3].transpose(-1, -2) + input_w2cs[:, :, :3, 3:4].transpose(-1,-2) # (B, V, H*W, 3)
+                depth_pred = pos_cam[..., 2] # (B, V, H*W)
+                disp_pred = 1.0 / depth_pred.clamp(min=1e-2)
+                disp_median = torch.median(disp_pred, dim=-1, keepdim=True)[0] # (B, V, 1)
+                disp_var = (disp_pred - disp_median).abs().mean(dim=-1, keepdim=True) # (B, V, 1)
+                disp_pred = (disp_pred - disp_median) / (disp_var + 1e-6)
 
         gaussians = {
             "xyz": xyz,
@@ -292,15 +343,51 @@ class LongLRM(nn.Module):
             "opacity": opacity
         }
 
+        # GS Pruning
+        num_gaussians = xyz.shape[1]
+        prune_ratio = self.config.model.gaussians.get("prune_ratio", 0.0)
+        if prune_ratio > 0:
+            keep_ratio = 1 - prune_ratio
+            random_ratio = self.config.model.gaussians.get("random_ratio", 0.0)
+            random_ratio = keep_ratio * random_ratio
+            keep_ratio = keep_ratio - random_ratio
+            num_keep = int(num_gaussians * keep_ratio)
+            num_keep_random = int(num_gaussians * random_ratio)
+            # rank by opacity
+            idx_sort = opacity.argsort(dim=1, descending=True)
+            keep_idx = idx_sort[:, :num_keep]
+            if num_keep_random > 0:
+                rest_idx = idx_sort[:, num_keep:]
+                random_idx = rest_idx[:, torch.randperm(rest_idx.shape[1])[:num_keep_random]]
+                keep_idx = torch.cat([keep_idx, random_idx], dim=1)
+            for k, v in gaussians.items():
+                v_shape = v.shape
+                v = v.reshape(v_shape[0], v_shape[1], -1)
+                v = v.gather(1, keep_idx.expand(-1, -1, v.shape[-1]))
+                gaussians[k] = v.reshape(v_shape[0], -1, *v_shape[2:])
+
+        ret_dict = {
+            "gaussians": gaussians
+        }
+
+        if input_pos_avg_inv is not None:
+            ret_dict["pos_avg_inv"] = input_pos_avg_inv
+
+        if scene_scale is not None:
+            ret_dict["scene_scale"] = scene_scale
+
+        if scene_name is not None:
+            ret_dict["scene_name"] = scene_name
+
         if test_c2ws is None:
-            return gaussians
+            return ret_dict
 
         # Render images at test views
-        xyz = xyz.float()
-        feature = feature.float()
-        scale = scale.exp().float()
-        rotation = F.normalize(rotation.float(), p=2, dim=-1)
-        opacity = opacity.sigmoid().squeeze(-1).float()
+        xyz = gaussians["xyz"].float()
+        feature = gaussians["feature"].float()
+        scale = gaussians["scale"].exp().float()
+        rotation = F.normalize(gaussians["rotation"].float(), p=2, dim=-1)
+        opacity = gaussians["opacity"].sigmoid().squeeze(-1).float()
         if use_checkpoint:
             # cannot simply use torch checkpoint as memory reduction relies on the loop through views
             renderings = GaussianRenderer.apply(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H, 
@@ -309,11 +396,49 @@ class LongLRM(nn.Module):
         else:
             renderings = self.render(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H) # (B, V, H, W, 3)
 
+        ret_dict["renderings"] = renderings
+
         if test_images is None:
-            return renderings
+            return ret_dict
 
-        #TODO: compute loss, gs pruning, visualize results 
+        # Compute loss
+        renderings = renderings.permute(0, 1, 4, 2, 3).flatten(0, 1) # (B*V, 3, H, W)
+        test_images = test_images.flatten(0, 1) # (B*V, 3, H, W)
+        l2_loss = F.mse_loss(renderings, test_images)
+        psnr = -10 * torch.log10(l2_loss)
+        total_loss = l2_loss * self.config.model.get("l2_loss", 1.0)
+        loss_dict = {
+            "l2_loss": l2_loss,
+            "psnr": psnr,
+        }
+        if self.config.model.get("perceptual_loss", 0.0) > 0:
+            perceptual_loss = PerceptualLoss(renderings.device)(renderings, test_images)
+            total_loss += perceptual_loss * self.config.model.perceptual_loss
+            loss_dict["perceptual_loss"] = perceptual_loss
+        if self.config.model.get("opacity_loss", 0.0) > 0:
+            opacity_loss = opacity.mean()
+            total_loss += opacity_loss * self.config.model.opacity_loss
+            loss_dict["opacity_loss"] = opacity_loss
+        if self.config.model.gaussians.get("align_to_pixel", True) and self.config.model.get("depth_loss", 0.0) > 0:
+            H_ = (H // 14) * 14
+            W_ = (W // 14) * 14
+            input_images_ = nn.functional.interpolate(input_images.flatten(0, 1), (H_, W_), mode='bilinear') # (B*V, 3, H_, W_)
+            disp_da = self.depth_anything(input_images_).reshape(B, V, H_, W_) # (B, V, H_, W_)
+            disp_da = nn.functional.interpolate(disp_da, (H, W), mode='nearest').to(disp_pred.dtype).reshape(B, V, H*W) # (B, V, H*W)
+            disp_median = torch.median(disp_da, dim=-1, keepdim=True)[0] # (B, V, 1)
+            disp_var = (disp_da - disp_median).abs().mean(dim=-1, keepdim=True) # (B, V, 1)
+            disp_da = (disp_da - disp_median) / (disp_var + 1e-6)
 
+            depth_loss = F.smooth_l1_loss(disp_pred, disp_da)
+            total_loss += depth_loss * self.config.model.depth_loss
+            loss_dict["depth_loss"] = depth_loss
+        
+        loss_dict["total_loss"] = total_loss
+        ret_dict["loss"] = loss_dict
+
+        #TODO: visualize results, evaluation metrics 
+
+        return ret_dict
 
 
 
@@ -400,8 +525,14 @@ if __name__ == "__main__":
                 "scale_max": 10,
                 "opacity_bias": 0,
                 "near_plane": 0.1,
-                "far_plane": 100
-            }
+                "far_plane": 100,
+                "prune_ratio": 0.5,
+                "random_ratio": 0.2,
+            },
+            "l2_loss": 1.0,
+            "perceptual_loss": 0.1,
+            "opacity_loss": 0.1,
+            "depth_loss": 0.1
         }
     })
     llrm = LongLRM(config).to("cuda")
@@ -414,6 +545,8 @@ if __name__ == "__main__":
     input_intr[:, :, 2] = w//2
     input_intr[:, :, 3] = h//2
     input_c2ws = torch.eye(4).unsqueeze(0).expand(batch_size, view, 4, 4).to("cuda")
+    input_pos_avg_inv = torch.eye(4).unsqueeze(0).expand(batch_size, 4, 4).to("cuda")
+    scene_scale = torch.ones(batch_size).to("cuda")
 
     view_test = 256
     test_intr = torch.zeros(batch_size, view_test, 4).to("cuda")
@@ -422,15 +555,26 @@ if __name__ == "__main__":
     test_intr[:, :, 2] = w//2
     test_intr[:, :, 3] = h//2
     test_c2ws = torch.eye(4).unsqueeze(0).expand(batch_size, view_test, 4, 4).to("cuda")
+    test_images = torch.ones(batch_size, view_test, 3, h, w).to("cuda")
 
     with torch.autocast(enabled=True, device_type="cuda"):
-        renderings = llrm(input_images, input_intr, input_c2ws,
-                        test_images=None, test_intr=test_intr, test_c2ws=test_c2ws, use_checkpoint=True)
-    renderings.mean().backward()
+        ret_dict = llrm(input_images, input_intr, input_c2ws,
+                        input_pos_avg_inv=input_pos_avg_inv, scene_scale=scene_scale,
+                        test_images=test_images, test_intr=test_intr, test_c2ws=test_c2ws, use_checkpoint=True)
+    gaussians = ret_dict["gaussians"]
+    renderings = ret_dict["renderings"]
+    #renderings.mean().backward()
     render = renderings.clone()
+    loss_dict = ret_dict["loss"]
+    loss_total = loss_dict["total_loss"]
+    loss_total.backward()
     print("Peak memory with checkpoint:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
     print("Renderings shape:", renderings.shape)
+    print("input shape:", input_images.shape)
+    print("num_gaussians:", gaussians["xyz"].shape[1])
+    print("loss:", loss_dict)
 
+    """
     grad = input_images.grad.clone()
     input_images.grad.zero_()
     with torch.autocast(enabled=True, device_type="cuda"):
@@ -448,3 +592,4 @@ if __name__ == "__main__":
     diff = (grad - grad2).abs()
     print("Max grad diff:", diff.max())
     print("Norm grad diff:", diff.norm())
+    """
