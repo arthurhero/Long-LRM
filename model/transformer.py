@@ -36,10 +36,10 @@ class Mlp(nn.Module):
         return x
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_flashatt_v2=True):
+    def __init__(self, dim, head_dim=64, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_flashatt_v2=True):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
+        assert dim % head_dim == 0, 'dim must be divisible by head_dim'
+        self.num_heads = dim // head_dim
         self.scale = qk_scale or head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -77,12 +77,12 @@ class SelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., mlp_bias=False, qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+    def __init__(self, dim, head_dim, mlp_ratio=4., mlp_bias=False, qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_flashatt_v2=True):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = SelfAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, use_flashatt_v2=use_flashatt_v2)
+            dim, head_dim=head_dim, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, use_flashatt_v2=use_flashatt_v2)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(in_features=dim, mlp_ratio=mlp_ratio, mlp_bias=mlp_bias, act_layer=act_layer, drop=drop)
@@ -105,11 +105,11 @@ if __name__ == "__main__":
     batch_size = 4
     seq_len = 128
     input_dim = 256
-    num_heads = 8
+    head_dim = 32
     mlp_ratio = 4
     
-    model = TransformerBlock(dim=input_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_flashatt_v2=True).to("cuda").to(torch.float16)
-    model_no_flashatt = TransformerBlock(dim=input_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_flashatt_v2=False).to("cuda").to(torch.float16)
+    model = TransformerBlock(dim=input_dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_flashatt_v2=True).to("cuda").to(torch.float16)
+    model_no_flashatt = TransformerBlock(dim=input_dim, head_dim=head_dim, mlp_ratio=mlp_ratio, use_flashatt_v2=False).to("cuda").to(torch.float16)
     # copy param to model_no_flashatt
     model_no_flashatt.load_state_dict(model.state_dict())
     x = torch.randn(batch_size, seq_len, input_dim).to("cuda").to(torch.float16)

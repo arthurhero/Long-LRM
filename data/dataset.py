@@ -13,6 +13,9 @@ from torch.utils.data import Dataset
 class Dataset(Dataset):
     def __init__(self, config):
         self.config = config
+        self.evaluation = config.get("evaluation", False)
+        if self.evaluation and "data_eval" in config:
+            self.config.data.update(config.data_eval)
         data_path_text = config.data.data_path
         data_folder = data_path_text.rsplit('/', 1)[0] 
         with open(data_path_text, 'r') as f:
@@ -27,15 +30,18 @@ class Dataset(Dataset):
         return len(self.data_path)
 
     def process_frames(self, frames, image_base_dir):
-        resize_h = self.config.data.resize_h
-        resize_w = self.config.data.resize_w
-        patch_size = self.config.data.patch_size
+        resize_h = self.config.data.get("resize_h", -1)
+        resize_w = self.config.data.get("resize_w", -1)
+        patch_size = self.config.model.patch_size
         patch_size = patch_size * 2 ** len(self.config.model.get("merge_layers", [])) 
         square_crop = self.config.data.square_crop
 
         images = [Image.open(os.path.join(image_base_dir, frame["file_path"])) for frame in frames]
         images = np.stack([np.array(image) for image in images]) # (num_frames, H, W, 3)
-        if resize_h == -1:
+        if resize_h == -1 and resize_w == -1:
+            resize_h = images.shape[1]
+            resize_w = images.shape[2]
+        elif resize_h == -1:
             resize_h = int(resize_w / images.shape[2] * images.shape[1])
         elif resize_w == -1:
             resize_w = int(resize_h / images.shape[1] * images.shape[2])
@@ -83,7 +89,9 @@ class Dataset(Dataset):
         input_frame_select_type = self.config.data.input_frame_select_type
         target_frame_select_type = self.config.data.target_frame_select_type
         num_input_frames = self.config.data.num_input_frames
-        num_target_frames = self.config.data.num_target_frames
+        num_target_frames = self.config.data.get("num_target_frames", 0)
+        if num_target_frames == 0:
+            assert target_frame_select_type == 'uniform_every'
         target_has_input = self.config.data.target_has_input
         min_frame_dist = self.config.data.min_frame_dist
         max_frame_dist = self.config.data.max_frame_dist
@@ -177,10 +185,10 @@ class Dataset(Dataset):
             "input_images": input_images,
             "input_intr": input_intr,
             "input_c2ws": input_c2ws,
-            "target_images": target_images,
-            "target_intr": target_intr,
-            "target_c2ws": target_c2ws,
-            "pos_avg_inv": pos_avg_inv,
+            "test_images": target_images,
+            "test_intr": target_intr,
+            "test_c2ws": target_c2ws,
+            "input_pos_avg_inv": pos_avg_inv,
             "scene_scale": scene_scale,
         }
 
@@ -194,7 +202,7 @@ if __name__ == "__main__":
     config.data.data_path = "example_data/mydesk.txt"
     config.data.resize_h = 128
     config.data.resize_w = 416
-    config.data.patch_size = 16
+    config.model.patch_size = 16
     config.data.square_crop = True
     config.data.input_frame_select_type = "kmeans"
     config.data.target_frame_select_type = "uniform_every"
@@ -214,10 +222,10 @@ if __name__ == "__main__":
         print("input_images:", data["input_images"].shape)
         print("input_intr:", data["input_intr"].shape)
         print("input_c2ws:", data["input_c2ws"].shape)
-        print("target_images:", data["target_images"].shape)
-        print("target_intr:", data["target_intr"].shape)
-        print("target_c2ws:", data["target_c2ws"].shape)
-        print("pos_avg_inv:", data["pos_avg_inv"].shape)
+        print("target_images:", data["test_images"].shape)
+        print("target_intr:", data["test_intr"].shape)
+        print("target_c2ws:", data["test_c2ws"].shape)
+        print("pos_avg_inv:", data["input_pos_avg_inv"].shape)
         print("scene_scale:", data["scene_scale"])
 
 

@@ -1,5 +1,6 @@
 # Copyright (c) 2024, Ziwen Chen.
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,20 +9,9 @@ from easydict import EasyDict as edict
 from einops import rearrange
 from gsplat import rasterization
 
-try:
-    from .transformer import TransformerBlock
-except:
-    from transformer import TransformerBlock
-
-try:
-    from .mamba2 import Mamba2Block
-except:
-    from mamba2 import Mamba2Block
-
-try:
-    from .loss import PerceptualLoss
-except:
-    from loss import PerceptualLoss
+from .transformer import TransformerBlock
+from .mamba2 import Mamba2Block
+from .loss import PerceptualLoss
 
 def _init_weights(m):
     if isinstance(m, nn.Linear):
@@ -66,7 +56,7 @@ class Processor(nn.Module):
                 )
                 dim_cur = dim_next
             if s == "t":
-                self.blocks.append(TransformerBlock(dim_cur, config.model.transformer.num_heads))
+                self.blocks.append(TransformerBlock(dim_cur, config.model.transformer.head_dim))
                 self.blocks[-1].apply(_init_weights)
             elif s == "m":
                 self.blocks.append(Mamba2Block(dim_cur, config.model.mamba2.d_state))
@@ -116,7 +106,7 @@ class GaussianRenderer(torch.autograd.Function):
     def render(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, 
                W, H, sh_degree, near_plane, far_plane):
         test_w2c = test_c2ws.float().inverse().unsqueeze(0) # (1, 4, 4)
-        test_intr_i = torch.zeros(3, 3).to(input_intr.device)
+        test_intr_i = torch.zeros(3, 3).to(test_intr.device)
         test_intr_i[0, 0] = test_intr[0]
         test_intr_i[1, 1] = test_intr[1]
         test_intr_i[0, 2] = test_intr[2]
@@ -127,7 +117,7 @@ class GaussianRenderer(torch.autograd.Function):
                                         test_w2c, test_intr_i, W, H, sh_degree=sh_degree, 
                                         near_plane=near_plane, far_plane=far_plane,
                                         render_mode="RGB",
-                                        backgrounds=torch.ones(1, 3).to(input_images.device),
+                                        backgrounds=torch.ones(1, 3).to(test_intr.device),
                                         rasterize_mode='classic') # (1, H, W, 3) 
         return rendering # (1, H, W, 3)
 
@@ -178,7 +168,7 @@ class LongLRM(nn.Module):
         super().__init__()
         self.config = config
         input_dim = 9 # RGB + plucker ray
-        self.patch_size = config.data.patch_size
+        self.patch_size = config.model.patch_size
         self.patch_size_out = self.patch_size * 2 ** len(config.model.get("merge_layers", [])) 
         if isinstance(config.model.dim, int):
             self.dim_start = config.model.dim
@@ -202,9 +192,9 @@ class LongLRM(nn.Module):
         self.tokenDecoder.apply(_init_weights)
 
         # use DepthAnything for depth loss
-        if config.model.get("depth_loss", 0.0) > 0:
+        if config.training.get("depth_loss", 0.0) > 0:
             try:
-                from depth_anything.dpt import DepthAnything
+                from model.depth_anything.dpt import DepthAnything
             except:
                 from .depth_anything.dpt import DepthAnything
             model_configs = {
@@ -214,7 +204,7 @@ class LongLRM(nn.Module):
             }
             encoder = 'vits' # or 'vitb', 'vits'
             self.depth_anything = DepthAnything(model_configs[encoder])
-            self.depth_anything.load_state_dict(torch.load(f'depth_anything/depth_anything_{encoder}14.pth'))
+            self.depth_anything.load_state_dict(torch.load(f'model/depth_anything/depth_anything_{encoder}14.pth'))
 
             for param in self.depth_anything.parameters():
                 param.requires_grad = False
@@ -276,14 +266,14 @@ class LongLRM(nn.Module):
                 test_c2ws[:, :, :3, 3] = test_c2ws[:, :, :3, 3] * scene_scale.reshape(B, 1, 1)
 
         # Embed camera info
-        ray_o = input_c2ws[:, :, :3, 3].unsqueeze(2).expand(-1, -1, H * W, -1) # (B, V, H*W, 3) # camera origin
+        ray_o = input_c2ws[:, :, :3, 3].unsqueeze(2).expand(-1, -1, H * W, -1).float() # (B, V, H*W, 3) # camera origin
         x, y = torch.meshgrid(torch.arange(W), torch.arange(H), indexing="xy")
         x = (x.to(input_intr.dtype) + 0.5).view(1, 1, -1).expand(B, V, -1).to(input_images.device)
         y = (y.to(input_intr.dtype) + 0.5).view(1, 1, -1).expand(B, V, -1).to(input_images.device)
         # unproject to camera space
         x = (x - input_intr[:, :, 2:3]) / input_intr[:, :, 0:1]
         y = (y - input_intr[:, :, 3:4]) / input_intr[:, :, 1:2]
-        ray_d = torch.stack([x, y, torch.ones_like(x)], dim=-1) # (B, V, H*W, 3)
+        ray_d = torch.stack([x, y, torch.ones_like(x)], dim=-1).float() # (B, V, H*W, 3)
         ray_d = F.normalize(ray_d, p=2, dim=-1)
         ray_d = ray_d @ input_c2ws[:, :, :3, :3].transpose(-1, -2) # (B, V, H*W, 3)
 
@@ -325,7 +315,7 @@ class LongLRM(nn.Module):
             dist = xyz.mean(dim=-1, keepdim=True).sigmoid() * self.config.model.gaussians.max_dist # (B, V*H*W, 1)
             xyz = dist * ray_d.reshape(B, -1, 3) + ray_o.reshape(B, -1, 3) # (B, V*H*W, 3)
             # get pixel-aligned depth before pruning
-            if self.config.model.get("depth_loss", 0.0) > 0:
+            if self.config.training.get("depth_loss", 0.0) > 0:
                 pos = xyz.reshape(B, V, H*W, 3)
                 input_w2cs = input_c2ws.float().inverse() # (B, V, 4, 4)
                 pos_cam = pos @ input_w2cs[:, :, :3, :3].transpose(-1, -2) + input_w2cs[:, :, :3, 3:4].transpose(-1,-2) # (B, V, H*W, 3)
@@ -395,31 +385,34 @@ class LongLRM(nn.Module):
                                                 self.config.model.gaussians.far_plane)
         else:
             renderings = self.render(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H) # (B, V, H, W, 3)
-
+        renderings = renderings.permute(0, 1, 4, 2, 3).contiguous() # (B, V, 3, H, W)
         ret_dict["renderings"] = renderings
 
         if test_images is None:
             return ret_dict
 
+        if not self.training:
+            return ret_dict
+
         # Compute loss
-        renderings = renderings.permute(0, 1, 4, 2, 3).flatten(0, 1) # (B*V, 3, H, W)
+        renderings = renderings.flatten(0, 1) # (B*V, 3, H, W)
         test_images = test_images.flatten(0, 1) # (B*V, 3, H, W)
         l2_loss = F.mse_loss(renderings, test_images)
         psnr = -10 * torch.log10(l2_loss)
-        total_loss = l2_loss * self.config.model.get("l2_loss", 1.0)
+        total_loss = l2_loss * self.config.training.get("l2_loss", 1.0)
         loss_dict = {
             "l2_loss": l2_loss,
             "psnr": psnr,
         }
-        if self.config.model.get("perceptual_loss", 0.0) > 0:
+        if self.config.training.get("perceptual_loss", 0.0) > 0:
             perceptual_loss = PerceptualLoss(renderings.device)(renderings, test_images)
-            total_loss += perceptual_loss * self.config.model.perceptual_loss
+            total_loss += perceptual_loss * self.config.training.perceptual_loss
             loss_dict["perceptual_loss"] = perceptual_loss
-        if self.config.model.get("opacity_loss", 0.0) > 0:
+        if self.config.training.get("opacity_loss", 0.0) > 0:
             opacity_loss = opacity.mean()
-            total_loss += opacity_loss * self.config.model.opacity_loss
+            total_loss += opacity_loss * self.config.training.opacity_loss
             loss_dict["opacity_loss"] = opacity_loss
-        if self.config.model.gaussians.get("align_to_pixel", True) and self.config.model.get("depth_loss", 0.0) > 0:
+        if self.config.model.gaussians.get("align_to_pixel", True) and self.config.training.get("depth_loss", 0.0) > 0:
             H_ = (H // 14) * 14
             W_ = (W // 14) * 14
             input_images_ = nn.functional.interpolate(input_images.flatten(0, 1), (H_, W_), mode='bilinear') # (B*V, 3, H_, W_)
@@ -430,17 +423,50 @@ class LongLRM(nn.Module):
             disp_da = (disp_da - disp_median) / (disp_var + 1e-6)
 
             depth_loss = F.smooth_l1_loss(disp_pred, disp_da)
-            total_loss += depth_loss * self.config.model.depth_loss
+            total_loss += depth_loss * self.config.training.depth_loss
             loss_dict["depth_loss"] = depth_loss
         
         loss_dict["total_loss"] = total_loss
         ret_dict["loss"] = loss_dict
 
-        #TODO: visualize results, evaluation metrics 
-
         return ret_dict
 
+    def save_evaluation_results(self, input_dict, output_dict, save_dir):
+        import torchvision
+        from .loss import compute_psnr, compute_ssim, compute_lpips
 
+        input_images = input_dict["input_images"] # (B, Vin, 3, H, W)
+        target_images = input_dict["test_images"] # (B, V, 3, H, W)
+        renderings = output_dict["renderings"] # (B, V, H, W, 3)
+        gaussians = output_dict["gaussians"]
+        B, V = target_images.shape[:2]
+
+        for i in range(B):
+            scene_name = input_dict["scene_name"][i]
+            scene_dir = os.path.join(save_dir, scene_name)
+            os.makedirs(scene_dir, exist_ok=True)
+            # evaluation metrics
+            psnr = compute_psnr(renderings[i], target_images[i]) # (V,)
+            ssim = compute_ssim(renderings[i], target_images[i]) # (V,)
+            lpips = compute_lpips(renderings[i], target_images[i]) # (V,)
+            with open(os.path.join(scene_dir, "metrics.csv"), "w") as f:
+                f.write("index, psnr, ssim, lpips\n")
+                for j in range(V):
+                    f.write(f"{j}, {psnr[j].item()}, {ssim[j].item()}, {lpips[j].item()}\n")
+                f.write(f"mean, {psnr.mean().item()}, {ssim.mean().item()}, {lpips.mean().item()}\n")
+                f.close()
+            # save images
+            input_images_path = os.path.join(scene_dir, "input_images.png")
+            input_image = input_images[i].permute(1, 2, 0, 3).flatten(2, 3) # (3, H, Vin*W)
+            torchvision.utils.save_image(input_image, input_images_path)
+            os.makedirs(os.path.join(scene_dir, "target"), exist_ok=True)
+            os.makedirs(os.path.join(scene_dir, "rendering"), exist_ok=True)
+            for j in range(V):
+                target_path = os.path.join(scene_dir, "target", f"{j}.png")
+                rendering_path = os.path.join(scene_dir, "rendering", f"{j}.png")
+                torchvision.utils.save_image(target_images[i, j], target_path)
+                torchvision.utils.save_image(renderings[i, j], rendering_path)
+            # TODO: save gaussians, interpolate rendering videos
 
 
 if __name__ == "__main__":
@@ -461,7 +487,7 @@ if __name__ == "__main__":
             "block_type": "tmtm",
             "merge_layers": [1,2],
             "transformer": {
-                "num_heads": 8
+                "head_dim": 32
             },
             "mamba2": {
                 "d_state": 256
@@ -512,7 +538,7 @@ if __name__ == "__main__":
             "block_type": "tmtm",
             "merge_layers": [1,2],
             "transformer": {
-                "num_heads": 8
+                "head_dim": 32
             },
             "mamba2": {
                 "d_state": 256
@@ -529,6 +555,8 @@ if __name__ == "__main__":
                 "prune_ratio": 0.5,
                 "random_ratio": 0.2,
             },
+        },
+        "training": {
             "l2_loss": 1.0,
             "perceptual_loss": 0.1,
             "opacity_loss": 0.1,
