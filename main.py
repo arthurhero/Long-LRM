@@ -8,6 +8,8 @@ from easydict import EasyDict as edict
 import wandb
 import yaml
 import random
+import time
+import datetime
 import numpy as np
 import cv2
 import torch
@@ -43,6 +45,8 @@ config_dict = config
 config = edict(config)
 if args.evaluation:
     config.evaluation = True
+if config.get("config_name", None) is not None:
+    config_name = config.config_name
 checkpoint_dir = os.path.join(config.checkpoint_dir, config_name)
 os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -66,7 +70,9 @@ torch.distributed.barrier()
 torch.backends.cuda.matmul.allow_tf32 = config.use_tf32
 torch.backends.cudnn.allow_tf32 = config.use_tf32
 
-logger = create_logger(output_dir=checkpoint_dir, dist_rank=rank, name=config_name)
+logger_dir = os.path.join(checkpoint_dir, 'logs')
+os.makedirs(logger_dir, exist_ok=True)
+logger = create_logger(output_dir=logger_dir, dist_rank=rank, name=config_name)
 logger.info(f"Rank {rank} / {world_size} with local rank {local_rank} / {local_world_size} and group rank {group_rank}")
 logger.info("Config:\n"+yaml.dump(config_dict, sort_keys=False))
 
@@ -91,8 +97,9 @@ if rank == 0:
 torch.distributed.barrier()
 
 datasampler = DistributedSampler(dataset)
+batch_size_per_gpu = config.training.batch_size_per_gpu
 dataloader = DataLoader(dataset, 
-                        batch_size=config.training.batch_size_per_gpu,
+                        batch_size=batch_size_per_gpu,
                         shuffle=False,
                         num_workers=config.training.num_workers,
                         persistent_workers=True,
@@ -113,15 +120,16 @@ if not config.get("evaluation", False):
     train_steps = config.training.train_steps
     grad_accum_steps = config.training.grad_accum_steps
     param_update_steps = int(train_steps / grad_accum_steps)
-    total_batch_size = config.training.batch_size_per_gpu * world_size
+    total_batch_size = batch_size_per_gpu * world_size
     num_epochs = int(train_steps * total_batch_size / len(dataset))
-    logger.info(f"train_steps: {train_steps}, grad_accum_steps: {grad_accum_steps}, param_update_steps: {param_update_steps}, \
-            batch_size_per_gpu: {config.training.batch_size_per_gpu}, world_size: {world_size}, batch_size_total: {total_batch_size}, \
-            dataset_size: {len(dataset)}, num_epochs: {num_epochs}")
+    logger.info(f"train_steps: {train_steps}, grad_accum_steps: {grad_accum_steps}, param_update_steps: {param_update_steps}, batch_size_per_gpu: {batch_size_per_gpu}, world_size: {world_size}, batch_size_total: {total_batch_size}, dataset_size: {len(dataset)}, num_epochs: {num_epochs}")
     optimizer = create_optimizer(model, config.training.weight_decay, config.training.lr,
                                 (config.training.beta1, config.training.beta2))
     scheduler = create_scheduler(optimizer, param_update_steps, config.training.warmup_steps,
                                  config.training.get('scheduler_type', 'cosine'))
+num_params = sum(p.numel() for p in model.parameters())
+num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+logger.info(f"Number of parameters: {num_params / 1e6:.2f}M, trainable: {num_trainable_params / 1e6:.2f}M")
 train_steps_done = 0
 resume_file = auto_resume_helper(checkpoint_dir)
 if resume_file is None:
@@ -168,8 +176,8 @@ if rank == 0  and not config.get("evaluation", False):
         wandb_id = wandb.util.generate_id()
         with open(os.path.join(checkpoint_dir, "wandb_id.txt"), "w") as f:
             f.write(wandb_id)
-    os.makedirs(os.path.join(checkpoint_dir, "wandb"), exist_ok=True)
-    wandb_dir_path = os.path.abspath(os.path.join(checkpoint_dir, "wandb"))
+    wandb_dir_path = "/home/user/wandb"
+    os.makedirs(wandb_dir_path, exist_ok=True)
     wandb.init(entity=config.training.wandb_entity,
                project=config.training.wandb_project,
                name=config_name,
@@ -178,6 +186,7 @@ if rank == 0  and not config.get("evaluation", False):
                config=copy.deepcopy(config),
                resume="allow")
     wandb.run.log_code(".")
+    logger.info(f"Initialized wandb")
 
 # evaluation
 if config.get("evaluation", False):
@@ -214,12 +223,18 @@ if config.get("evaluation", False):
             scene_dir = os.path.join(evaluation_dir, scene_folder)
             with open(os.path.join(scene_dir, "metrics.csv"), "r") as f:
                 metric_names = f.readline().strip().split(",")[1:]
-                scene_metrics = f.readlines()[-1].strip().split(",")[1:]
+                metric_lines = f.readlines()[-3:]
+                scene_metrics = metric_lines[0].strip().split(",")[1:]
                 scene_metrics = [float(x) for x in scene_metrics]
                 for key, value in zip(metric_names, scene_metrics):
                     if key not in metric_dict:
                         metric_dict[key] = []
                     metric_dict[key].append(value)
+                for line in metric_lines[1:]:
+                    key, value = line.strip().split(",")
+                    if key not in metric_dict:
+                        metric_dict[key] = []
+                    metric_dict[key].append(float(value))
         with open(os.path.join(evaluation_dir, "summary.csv"), "w") as f:
             f.write("scene_name,"+",".join(metric_dict.keys())+"\n")
             for i, scene_folder in enumerate(scene_folders):
@@ -228,7 +243,7 @@ if config.get("evaluation", False):
             for key in metric_dict.keys():
                 scene_num = len(metric_dict[key])
                 metric_dict[key] = np.mean(metric_dict[key])
-                eval_res += f"{key}: {metric_dict[key]}, num_scenes: {scene_num}\n"
+                eval_res += f"{key}: {metric_dict[key]:.4f}, num_scenes: {scene_num}\n"
             logger.info(f"Summary of evaluation results:\n{eval_res}")
             f.write("mean,"+",".join([str(metric_dict[key]) for key in metric_dict.keys()])+"\n")
             f.close()
@@ -243,6 +258,124 @@ if rank == 0 and config.training.get("perceptual_loss", 0.0) > 0:
     del vgg
 torch.distributed.barrier()
 model.train()
+len_dataset = len(dataset) // batch_size_per_gpu * batch_size_per_gpu
+cur_epoch = train_steps_done * total_batch_size // len_dataset
+datasampler.set_epoch(cur_epoch)
+dataloader_iter = iter(dataloader)
+param_optim_dict = {n: p for n, p in model.named_parameters() if p.requires_grad}
+param_optim_list = [p for p in param_optim_dict.values()]
 train_steps_start = train_steps_done
+while train_steps_done <= train_steps:
+    try:
+        data = next(dataloader_iter)
+    except StopIteration:
+        #print("We have exhausted the dataloader iterator, resetting it")
+        cur_epoch = train_steps_done * total_batch_size // len_dataset
+        datasampler.set_epoch(cur_epoch)
+        dataloader_iter = iter(dataloader)
+        data = next(dataloader_iter)
+    for key in data.keys():
+        if isinstance(data[key], torch.Tensor):
+            data[key] = data[key].to(device)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    update_param = ((train_steps_done+1) % grad_accum_steps == 0)
+    context = torch.autocast(
+        enabled=config.use_amp,
+        device_type="cuda",
+        dtype=amp_dtype_mapping[config.amp_dtype],
+    )
+    if not update_param:
+        context = model.no_sync(), context
+    with context:
+        ret_dict = model(**data)
+    torch.cuda.synchronize()
+    fwd_end_time = time.time()
+    fwd_time = fwd_end_time - start_time
+    fwd_time_str = f"{fwd_time:.2f} s"
 
+    loss_dict = ret_dict['loss']
+    total_loss = loss_dict['total_loss']
+    scaler.scale(total_loss / grad_accum_steps).backward()
+    train_steps_done += 1
 
+    skip_optimizer_step = False
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        logger.warning(f"NaN or Inf loss detected, skip this iteration")
+        skip_optimizer_step = True
+        loss_dict['total_loss'] = torch.tensor(0.0).to(device)
+    torch.cuda.synchronize()
+    bwd_end_time = time.time()
+    bwd_time = bwd_end_time - fwd_end_time
+    bwd_time_str = f"{bwd_time:.2f} s"
+
+    if update_param and (not skip_optimizer_step):
+        # Unscales the gradients of optimizer's assigned parameters in-place
+        scaler.unscale_(optimizer)
+        with torch.no_grad():
+            for n, p in param_optim_dict.items(): 
+                if p.grad is None:
+                    logger.warning(
+                        f"step {train_steps_done} found a None grad for {n}"
+                    )
+                else:
+                    p.grad.nan_to_num_(nan=0.0, posinf=1e-3, neginf=-1e-3)
+        total_grad_norm = 0.0
+        if config.training.grad_clip_norm > 0:
+            grad_clip_norm = config.training.grad_clip_norm
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(param_optim_list, max_norm=grad_clip_norm).item()
+            if total_grad_norm > grad_clip_norm * 2.0:
+                logger.warning(f"step {train_steps_done} grad norm too large {total_grad_norm} > {grad_clip_norm * 2.}")
+            allowed_gradnorm = grad_clip_norm * config.training.get("allowed_gradnorm_factor", 5.0)
+            if total_grad_norm > allowed_gradnorm:
+                skip_optimizer_step = True
+                logger.warning(f"step {train_steps_done} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step")
+        if not skip_optimizer_step:
+            scaler.step(optimizer)
+            scaler.update()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)        
+    torch.cuda.synchronize()
+    optim_end_time = time.time()
+    optim_time = optim_end_time - bwd_end_time
+    optim_time_str = f"{optim_time:.2f} s"
+
+    # logging and checkpointing
+    if rank == 0:
+        gaussian_usage = ret_dict['gaussian_usage'].mean().item()
+        loss_dict = {k: v.item() for k, v in loss_dict.items()}
+        if train_steps_done % config.training.print_every == 0 or train_steps_done < train_steps_start + 100:
+            loss_str = ", ".join([f"{k}: {v:.4f}" for k, v in loss_dict.items()])
+            loss_str += f", gaussian_usage: {gaussian_usage:.4f}"
+            memory_usage = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0
+            logger.info(f"\nStep {train_steps_done} / {train_steps}, Epoch {cur_epoch}\n{loss_str}\nfwd_time: {fwd_time_str}, bwd_time: {bwd_time_str}, optim_time: {optim_time_str}, memory: {memory_usage:.2f} MB")
+        if train_steps_done % config.training.wandb_every == 0 or train_steps_done < train_steps_start + 100:
+            log_dict = {
+                "iter": train_steps_done,
+                "train_steps_done": train_steps_done,
+                "param_update_steps": train_steps_done // grad_accum_steps,
+                "lr": optimizer.param_groups[0]["lr"],
+                "iter_time": time.time() - start_time,
+                "grad_norm": total_grad_norm,
+                "epoch": cur_epoch,
+                "train/gaussian_usage": gaussian_usage,
+            }
+            log_dict.update({"train/" + k: v for k, v in loss_dict.items()})
+            wandb.log(log_dict, step = train_steps_done)
+        if train_steps_done % config.training.checkpoint_every == 0 or train_steps_done == train_steps:
+            checkpoint = {
+                'model': model.module.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'train_steps_done': train_steps_done,
+            }
+            torch.save(checkpoint, os.path.join(checkpoint_dir, f"checkpoint_{train_steps_done:09d}.pt"))
+            logger.info(f"Saved checkpoint at step {train_steps_done}")
+        if train_steps_done % config.training.vis_every == 0 or train_steps_done < train_steps_start + 25:
+            save_gaussian = train_steps_done % config.training.save_gaussian_every == 0
+            save_video = train_steps_done % config.training.save_video_every == 0
+            model.module.save_visualization(data, ret_dict, os.path.join(checkpoint_dir, f"vis_{train_steps_done:09d}"),
+                                            save_gaussian = save_gaussian, save_video = save_video)
+    torch.distributed.barrier()
+torch.distributed.barrier()
+destroy_process_group()

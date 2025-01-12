@@ -1,6 +1,8 @@
 # Copyright (c) 2024, Ziwen Chen.
 
 import os
+import time
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -103,9 +105,9 @@ class Processor(nn.Module):
 
 class GaussianRenderer(torch.autograd.Function):
     @staticmethod
-    def render(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, 
+    def render(xyz, feature, scale, rotation, opacity, test_c2w, test_intr, 
                W, H, sh_degree, near_plane, far_plane):
-        test_w2c = test_c2ws.float().inverse().unsqueeze(0) # (1, 4, 4)
+        test_w2c = test_c2w.float().inverse().unsqueeze(0) # (1, 4, 4)
         test_intr_i = torch.zeros(3, 3).to(test_intr.device)
         test_intr_i[0, 0] = test_intr[0]
         test_intr_i[1, 1] = test_intr[1]
@@ -179,11 +181,13 @@ class LongLRM(nn.Module):
         self.num_global_tokens = config.model.num_global_tokens
         if self.num_global_tokens > 0:
             self.global_token_init = nn.Parameter(torch.randn(1, self.num_global_tokens, self.dim_start))
-        self.tokenizer = nn.Linear(input_dim * self.patch_size ** 2, self.dim_start)
+            nn.init.trunc_normal_(self.global_token_init, std=0.02)
+        self.tokenizer = nn.Linear(input_dim * self.patch_size ** 2, self.dim_start, bias=False)
         self.tokenizer.apply(_init_weights)
+        self.input_layernorm = nn.LayerNorm(self.dim_start, bias=False)
         self.processor = Processor(config)
         self.tokenDecoder = nn.Sequential(
-            nn.LayerNorm(self.dim_out),
+            nn.LayerNorm(self.dim_out, bias=False),
             nn.Linear(
                 self.dim_out, (3 + (config.model.gaussians.sh_degree + 1) ** 2 * 3 + 3 + 4 + 1) * self.patch_size_out ** 2,
                 bias=False,
@@ -253,6 +257,7 @@ class LongLRM(nn.Module):
         input_pos_avg_inv: (B, 4, 4)
         scene_scale: (B)
         """
+        inference_start = time.time()
         B, V, _, H, W = input_images.shape
 
         if input_pos_avg_inv is not None:
@@ -268,16 +273,16 @@ class LongLRM(nn.Module):
         # Embed camera info
         ray_o = input_c2ws[:, :, :3, 3].unsqueeze(2).expand(-1, -1, H * W, -1).float() # (B, V, H*W, 3) # camera origin
         x, y = torch.meshgrid(torch.arange(W), torch.arange(H), indexing="xy")
-        x = (x.to(input_intr.dtype) + 0.5).view(1, 1, -1).expand(B, V, -1).to(input_images.device)
-        y = (y.to(input_intr.dtype) + 0.5).view(1, 1, -1).expand(B, V, -1).to(input_images.device)
+        x = (x.to(input_intr.dtype) + 0.5).view(1, 1, -1).expand(B, V, -1).to(input_images.device).contiguous()
+        y = (y.to(input_intr.dtype) + 0.5).view(1, 1, -1).expand(B, V, -1).to(input_images.device).contiguous()
         # unproject to camera space
         x = (x - input_intr[:, :, 2:3]) / input_intr[:, :, 0:1]
         y = (y - input_intr[:, :, 3:4]) / input_intr[:, :, 1:2]
         ray_d = torch.stack([x, y, torch.ones_like(x)], dim=-1).float() # (B, V, H*W, 3)
         ray_d = F.normalize(ray_d, p=2, dim=-1)
-        ray_d = ray_d @ input_c2ws[:, :, :3, :3].transpose(-1, -2) # (B, V, H*W, 3)
+        ray_d = ray_d @ input_c2ws[:, :, :3, :3].transpose(-1, -2).contiguous() # (B, V, H*W, 3)
 
-        input_image_cam = torch.cat([input_images.view(B, V, 3, -1).permute(0, 1, 3, 2) * 2 - 1, 
+        input_image_cam = torch.cat([input_images.view(B, V, 3, -1).permute(0, 1, 3, 2).contiguous() * 2 - 1, 
                                      torch.cross(ray_o, ray_d, dim=-1),
                                      ray_d], dim=-1) # (B, V, H*W, 9)
 
@@ -296,6 +301,7 @@ class LongLRM(nn.Module):
             tokens = torch.cat([global_tokens, image_tokens], dim=1) # (B, num_global_tokens+V*hh*ww, D)
         else:
             tokens = image_tokens
+        tokens = self.input_layernorm(tokens)
 
         # Process tokens
         tokens, hh, ww = self.processor(tokens, self.num_global_tokens, V, hh, ww, use_checkpoint=use_checkpoint)
@@ -306,7 +312,7 @@ class LongLRM(nn.Module):
         gaussians = self.tokenDecoder(image_tokens) # (B, V*hh*ww, ph*pw*(3 + (sh_degree+1)**2*3 + 3 + 4 + 1))
         gaussians = rearrange(gaussians, "b (v hh ww) (ph pw d) -> b (v hh ph ww pw) d", v=V, hh=hh, ww=ww, ph=patch_size, pw=patch_size)
         xyz, feature, scale, rotation, opacity = torch.split(gaussians, [3, (self.config.model.gaussians.sh_degree + 1) ** 2 * 3, 3, 4, 1], dim=-1)
-        feature = feature.view(B, V*H*W, (self.config.model.gaussians.sh_degree + 1) ** 2, 3)
+        feature = feature.view(B, V*H*W, (self.config.model.gaussians.sh_degree + 1) ** 2, 3).contiguous()
         scale = (scale + self.config.model.gaussians.scale_bias).clamp(max = self.config.model.gaussians.scale_max) 
         opacity = opacity + self.config.model.gaussians.opacity_bias
         
@@ -318,7 +324,7 @@ class LongLRM(nn.Module):
             if self.config.training.get("depth_loss", 0.0) > 0:
                 pos = xyz.reshape(B, V, H*W, 3)
                 input_w2cs = input_c2ws.float().inverse() # (B, V, 4, 4)
-                pos_cam = pos @ input_w2cs[:, :, :3, :3].transpose(-1, -2) + input_w2cs[:, :, :3, 3:4].transpose(-1,-2) # (B, V, H*W, 3)
+                pos_cam = pos @ input_w2cs[:, :, :3, :3].transpose(-1, -2).contiguous() + input_w2cs[:, :, :3, 3:4].transpose(-1,-2).contiguous() # (B, V, H*W, 3)
                 depth_pred = pos_cam[..., 2] # (B, V, H*W)
                 disp_pred = 1.0 / depth_pred.clamp(min=1e-2)
                 disp_median = torch.median(disp_pred, dim=-1, keepdim=True)[0] # (B, V, 1)
@@ -332,10 +338,12 @@ class LongLRM(nn.Module):
             "rotation": rotation,
             "opacity": opacity
         }
+        inference_time = time.time() - inference_start
 
         # GS Pruning
         num_gaussians = xyz.shape[1]
         prune_ratio = self.config.model.gaussians.get("prune_ratio", 0.0)
+        gaussian_usage = (opacity.sigmoid() > self.config.model.gaussians.get("opacity_threshold", 0.001)).float().mean(dim=1).squeeze(-1) # (B,)
         if prune_ratio > 0:
             keep_ratio = 1 - prune_ratio
             random_ratio = self.config.model.gaussians.get("random_ratio", 0.0)
@@ -357,7 +365,9 @@ class LongLRM(nn.Module):
                 gaussians[k] = v.reshape(v_shape[0], -1, *v_shape[2:])
 
         ret_dict = {
-            "gaussians": gaussians
+            "gaussians": gaussians,
+            "gaussian_usage": gaussian_usage,
+            "inference_time": inference_time
         }
 
         if input_pos_avg_inv is not None:
@@ -405,7 +415,7 @@ class LongLRM(nn.Module):
             "psnr": psnr,
         }
         if self.config.training.get("perceptual_loss", 0.0) > 0:
-            perceptual_loss = PerceptualLoss(renderings.device)(renderings, test_images)
+            perceptual_loss = PerceptualLoss(renderings.device, self.config)(renderings, test_images)
             total_loss += perceptual_loss * self.config.training.perceptual_loss
             loss_dict["perceptual_loss"] = perceptual_loss
         if self.config.training.get("opacity_loss", 0.0) > 0:
@@ -416,7 +426,9 @@ class LongLRM(nn.Module):
             H_ = (H // 14) * 14
             W_ = (W // 14) * 14
             input_images_ = nn.functional.interpolate(input_images.flatten(0, 1), (H_, W_), mode='bilinear') # (B*V, 3, H_, W_)
-            disp_da = self.depth_anything(input_images_).reshape(B, V, H_, W_) # (B, V, H_, W_)
+            with torch.no_grad():
+                self.depth_anything.eval()
+                disp_da = self.depth_anything(input_images_).reshape(B, V, H_, W_) # (B, V, H_, W_)
             disp_da = nn.functional.interpolate(disp_da, (H, W), mode='nearest').to(disp_pred.dtype).reshape(B, V, H*W) # (B, V, H*W)
             disp_median = torch.median(disp_da, dim=-1, keepdim=True)[0] # (B, V, 1)
             disp_var = (disp_da - disp_median).abs().mean(dim=-1, keepdim=True) # (B, V, 1)
@@ -425,11 +437,173 @@ class LongLRM(nn.Module):
             depth_loss = F.smooth_l1_loss(disp_pred, disp_da)
             total_loss += depth_loss * self.config.training.depth_loss
             loss_dict["depth_loss"] = depth_loss
+
+            ret_dict["disp_da"] = disp_da.reshape(B, V, H, W)
+            ret_dict["disp_pred"] = disp_pred.reshape(B, V, H, W)
         
         loss_dict["total_loss"] = total_loss
         ret_dict["loss"] = loss_dict
 
         return ret_dict
+
+    def save_gaussian_ply(self, gaussian_dict, save_path, opacity_threshold=None):
+        """
+        Adapted from the original 3D GS implementation
+        https://github.com/graphdeco-inria/gaussian-splatting/blob/main/scene/gaussian_model.py
+        """
+        from plyfile import PlyData, PlyElement
+        xyz = gaussian_dict["xyz"].detach().cpu().float() # (N, 3)
+        normal = torch.zeros_like(xyz) # (N, 3)
+        N = xyz.shape[0]
+        feature = gaussian_dict["feature"].detach().cpu().float() # (N, (sh_degree+1)**2, 3)
+        f_dc = feature[:, 0].contiguous() # (N, 3)
+        f_rest_full = torch.zeros(N, 3*(3+1)**2-3).float()
+        if feature.shape[1] > 1:
+            f_rest = feature[:, 1:].transpose(1, 2).reshape(N, -1) # (N, 3*(sh_degree+1)**2-3)
+            f_rest_full[:, :f_rest.shape[1]] = f_rest
+        f_rest_full = f_rest_full.contiguous()
+        scale = gaussian_dict["scale"].detach().cpu().float() # (N, 3)
+        opacity = gaussian_dict["opacity"].detach().cpu().float() # (N, 1)
+        rotation = gaussian_dict["rotation"].detach().cpu().float() # (N, 4)
+        attributes = np.concatenate([xyz.numpy(), 
+                                     normal.numpy().astype(np.uint8),
+                                     f_dc.numpy(),
+                                     f_rest_full.numpy(),
+                                     opacity.numpy(),
+                                     scale.numpy(),
+                                     rotation.numpy()
+                                    ], axis=1)
+        if opacity_threshold is not None:                             
+            attributes = attributes[opacity.squeeze(-1).sigmoid().numpy() > opacity_threshold]
+        attribute_list = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        attribute_list += ['f_dc_{}'.format(i) for i in range(f_dc.shape[1])]
+        attribute_list += ['f_rest_{}'.format(i) for i in range(f_rest_full.shape[1])]
+        attribute_list += ['opacity']
+        attribute_list += ['scale_{}'.format(i) for i in range(scale.shape[1])]
+        attribute_list += ['rot_{}'.format(i) for i in range(rotation.shape[1])]
+        dtype_full = [(attribute, 'f4') for attribute in attribute_list]
+        dtype_full[3:6] = [(attribute, 'u1') for attribute in attribute_list[3:6]]
+        elements = np.empty(attributes.shape[0], dtype=dtype_full)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(save_path)
+
+    def save_input_video(self, input_intr, input_c2ws, gaussian_dict, H, W, save_path, insert_frame_num = 8):
+        """
+        Interpolate input frames and save rendered video
+        input_intr: (V, 4), (fx, fy, cx, cy)
+        input_c2ws: (V, 4, 4)
+        """
+        import cv2
+        from .camera_utils import get_interpolated_poses_many
+        import subprocess
+        V = input_intr.shape[0]
+        device = input_intr.device
+        input_intr = input_intr.detach().cpu().float()
+        input_c2ws = input_c2ws.detach().cpu().float()
+
+        input_intr_mat = torch.zeros((V, 3, 3))
+        input_intr_mat[:, 0, 0] = input_intr[:, 0]
+        input_intr_mat[:, 1, 1] = input_intr[:, 1]
+        input_intr_mat[:, 0, 2] = input_intr[:, 2]
+        input_intr_mat[:, 1, 2] = input_intr[:, 3]
+        input_c2ws = torch.cat([input_c2ws, input_c2ws[:1]], dim=0) # wrap around
+        input_intr_mat = torch.cat([input_intr_mat, input_intr_mat[:1]], dim=0) # wrap around
+        c2ws, intr_mat, _ = get_interpolated_poses_many(input_c2ws[:, :3, :4], input_intr_mat, steps_per_transition = insert_frame_num)
+        V = c2ws.shape[0]
+        c2ws_mat = torch.eye(4).unsqueeze(0).repeat(V, 1, 1)
+        c2ws_mat[:, :3, :4] = c2ws
+        intr_fxfycxcy = torch.zeros(V, 4)
+        intr_fxfycxcy[:, 0] = intr_mat[:, 0, 0]
+        intr_fxfycxcy[:, 1] = intr_mat[:, 1, 1]
+        intr_fxfycxcy[:, 2] = intr_mat[:, 0, 2]
+        intr_fxfycxcy[:, 3] = intr_mat[:, 1, 2]
+        c2ws_mat = c2ws_mat.to(device)
+        intr_fxfycxcy = intr_fxfycxcy.to(device)
+
+        xyz = gaussian_dict["xyz"].detach().float().to(device) # (N, 3)
+        feature = gaussian_dict["feature"].detach().float().to(device) # (N, (sh_degree+1)**2, 3)
+        scale = gaussian_dict["scale"].detach().float().exp().to(device) # (N, 3)
+        rotation = gaussian_dict["rotation"].detach().float().to(device) # (N, 4)
+        rotation = F.normalize(rotation, p=2, dim=-1)
+        opacity = gaussian_dict["opacity"].detach().float().sigmoid().to(device).squeeze(-1) # (N, 1)
+
+        renderings = []
+        for i in range(V):
+            rendering = GaussianRenderer.render(xyz, feature, scale, rotation, opacity,
+                                                c2ws_mat[i], intr_fxfycxcy[i], W, H,
+                                                self.config.model.gaussians.sh_degree,
+                                                self.config.model.gaussians.near_plane,
+                                                self.config.model.gaussians.far_plane)
+            rendering = rendering.squeeze(0).clamp(0, 1).cpu().numpy() # (H, W, 3)
+            rendering = (rendering * 255).astype(np.uint8)
+            rendering = cv2.cvtColor(rendering, cv2.COLOR_RGB2BGR)
+            renderings.append(rendering)
+        tmp_save_path = save_path.replace(".mp4", "_tmp.mp4")
+        video_writer = cv2.VideoWriter(tmp_save_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (W, H))
+        for r in renderings:
+            video_writer.write(r)
+        video_writer.release()
+        subprocess.run(f"ffmpeg -y -i {tmp_save_path} -vcodec libx264 -f mp4 {save_path}", shell=True) 
+        os.remove(tmp_save_path)
+
+    def save_visualization(self, input_dict, output_dict, save_dir, save_gaussian=False, save_video=False):
+        import torchvision
+        import matplotlib.pyplot as plt
+        os.makedirs(save_dir, exist_ok=True)
+
+        input_images = input_dict["input_images"] # (B, V, 3, H, W)
+        target_images = input_dict["test_images"] # (B, V, 3, H, W)
+        renderings = output_dict["renderings"] # (B, V, 3, H, W)
+        B, V, _, H, W = target_images.shape
+
+        # save images of first batch
+        input_image_path = os.path.join(save_dir, "input_images.png")
+        input_image = input_images[0].permute(1, 2, 0, 3).flatten(2, 3) # (3, H, Vin*W)
+        torchvision.utils.save_image(input_image, input_image_path)
+        target_rendering_path = os.path.join(save_dir, "target_renderings.png")
+        target_renderings = []
+        for i in range(B):
+            target_image = target_images[i].permute(1, 2, 0, 3).flatten(2, 3) # (3, H, V*W)
+            rendering_image = renderings[i].permute(1, 2, 0, 3).flatten(2, 3) # (3, H, V*W)
+            target_renderings.append(target_image)
+            target_renderings.append(rendering_image)
+        target_rendering = torch.cat(target_renderings, dim=1) # (3, 2*B*H, V*W)
+        torchvision.utils.save_image(target_rendering, target_rendering_path)
+
+        if "disp_da" in output_dict:
+            cmapper = plt.colormaps['magma']
+            disp_da = output_dict["disp_da"][0].detach().permute(1, 0, 2).flatten(1, 2) # (V, H, W) -> (H, V*W)
+            disp_pred = output_dict["disp_pred"][0].detach().permute(1, 0, 2).flatten(1, 2) # (V, H, W) -> (H, V*W)
+            disp_da = (1.0 / (disp_da + 3.0).clamp(min=0.001)) / 1.0
+            disp_pred = (1.0 / (disp_pred + 3.0).clamp(min=0.001)) / 1.0
+            disp_da = cmapper(disp_da.cpu().numpy())[..., :3]
+            disp_pred = cmapper(disp_pred.cpu().numpy())[..., :3]
+            disp_image = torch.cat([torch.tensor(disp_da), torch.tensor(disp_pred)], dim=0).permute(2, 0, 1) # (3, 2*H, V*W)
+            disp_path = os.path.join(save_dir, "disp.png")
+            torchvision.utils.save_image(disp_image, disp_path)
+
+        # save gaussian ply of first batch
+        if save_gaussian:
+            gaussians = output_dict["gaussians"]
+            gaussian_first = {k: v[0] for k, v in gaussians.items()}
+            opacity_threshold = self.config.model.gaussians.get("opacity_threshold", 0.001)
+            self.save_gaussian_ply(gaussian_first, os.path.join(save_dir, f"gaussians_{str(opacity_threshold).split('.')[-1]}.ply"), opacity_threshold)
+
+        # save input traj video
+        if save_video:
+            gaussians = output_dict["gaussians"]
+            input_intr = input_dict["input_intr"][0]
+            input_c2ws = input_dict["input_c2ws"][0]
+            gaussian_first = {k: v[0] for k, v in gaussians.items()}
+            input_pos_avg_inv = input_dict["input_pos_avg_inv"][0] if "input_pos_avg_inv" in input_dict else None
+            scene_scale = input_dict["scene_scale"][0] if "scene_scale" in input_dict else None
+            if input_pos_avg_inv is not None:
+                input_c2ws = input_pos_avg_inv.unsqueeze(0) @ input_c2ws
+            if scene_scale is not None:
+                input_c2ws[:, :3, 3] = input_c2ws[:, :3, 3] * scene_scale
+            self.save_input_video(input_intr, input_c2ws, gaussian_first, H, W, os.path.join(save_dir, "input_traj.mp4"),
+                                  insert_frame_num=self.config.get("insert_frame_num", 8))
 
     def save_evaluation_results(self, input_dict, output_dict, save_dir):
         import torchvision
@@ -439,7 +613,9 @@ class LongLRM(nn.Module):
         target_images = input_dict["test_images"] # (B, V, 3, H, W)
         renderings = output_dict["renderings"] # (B, V, H, W, 3)
         gaussians = output_dict["gaussians"]
-        B, V = target_images.shape[:2]
+        gaussian_usage = output_dict["gaussian_usage"] # (B,)
+        inference_time = output_dict["inference_time"] # float
+        B, V, _, H, W = target_images.shape
 
         for i in range(B):
             scene_name = input_dict["scene_name"][i]
@@ -454,6 +630,8 @@ class LongLRM(nn.Module):
                 for j in range(V):
                     f.write(f"{j}, {psnr[j].item()}, {ssim[j].item()}, {lpips[j].item()}\n")
                 f.write(f"mean, {psnr.mean().item()}, {ssim.mean().item()}, {lpips.mean().item()}\n")
+                f.write(f"gaussian_usage, {gaussian_usage[i].item()}\n")
+                f.write(f"inference_time, {inference_time}\n") 
                 f.close()
             # save images
             input_images_path = os.path.join(scene_dir, "input_images.png")
@@ -466,8 +644,22 @@ class LongLRM(nn.Module):
                 rendering_path = os.path.join(scene_dir, "rendering", f"{j}.png")
                 torchvision.utils.save_image(target_images[i, j], target_path)
                 torchvision.utils.save_image(renderings[i, j], rendering_path)
-            # TODO: save gaussians, interpolate rendering videos
+            # save gaussian ply
+            gaussian = {k: v[i] for k, v in gaussians.items()}
+            opacity_threshold = self.config.model.gaussians.get("opacity_threshold", 0.001)
+            self.save_gaussian_ply(gaussian, os.path.join(scene_dir, f"gaussians_{str(opacity_threshold).split('.')[-1]}.ply"), opacity_threshold)
 
+            # save input traj video
+            input_intr = input_dict["input_intr"][i]
+            input_c2ws = input_dict["input_c2ws"][i]
+            input_pos_avg_inv = input_dict["input_pos_avg_inv"][i] if "input_pos_avg_inv" in input_dict else None
+            scene_scale = input_dict["scene_scale"][i] if "scene_scale" in input_dict else None
+            if input_pos_avg_inv is not None:
+                input_c2ws = input_pos_avg_inv.unsqueeze(0) @ input_c2ws
+            if scene_scale is not None:
+                input_c2ws[:, :3, 3] = input_c2ws[:, :3, 3] * scene_scale
+            self.save_input_video(input_intr, input_c2ws, gaussian, H, W, os.path.join(scene_dir, "input_traj.mp4"),
+                                  insert_frame_num=self.config.get("insert_frame_num", 8))
 
 if __name__ == "__main__":
 
