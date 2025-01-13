@@ -36,6 +36,8 @@ def recursive_merge(dict1, dict2):
             dict1[key] = value
         elif isinstance(value, dict):
             dict1[key] = recursive_merge(dict1[key], value)
+        else:
+            dict1[key] = value
     return dict1
 if args.default_config is not None:
     default_config = yaml.safe_load(open(args.default_config, 'r'))
