@@ -189,11 +189,17 @@ class Dataset(Dataset):
             pos_avg = torch.stack([right_avg, down_avg, forward_avg, position_avg], dim=1) # (3, 4)
             pos_avg = torch.cat([pos_avg, torch.tensor([[0, 0, 0, 1]], device=pos_avg.device).float()], dim=0) # (4, 4)
             pos_avg_inv = torch.inverse(pos_avg)
+
+            input_c2ws = torch.matmul(pos_avg_inv.unsqueeze(0), input_c2ws)
+            target_c2ws = torch.matmul(pos_avg_inv.unsqueeze(0), target_c2ws)
      
             # scale scene size
             position_max = input_c2ws[:, :3, 3].abs().max()
             scene_scale = self.config.data.get("scene_scale", 1.0) * position_max
             scene_scale = 1.0 / scene_scale
+
+            input_c2ws[:, :3, 3] *= scene_scale
+            target_c2ws[:, :3, 3] *= scene_scale
      
             ret_dict = {
                 "scene_name": scene_name,
@@ -203,7 +209,7 @@ class Dataset(Dataset):
                 "test_images": target_images,
                 "test_intr": target_intr,
                 "test_c2ws": target_c2ws,
-                "input_pos_avg_inv": pos_avg_inv,
+                "pos_avg_inv": pos_avg_inv,
                 "scene_scale": scene_scale,
             }
         except:

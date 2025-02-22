@@ -21,18 +21,20 @@ Create a config file in YAML format.
 Run `sh create_env.sh` to install the required packages.
 Use `torchrun` to launch the training loop:  
 ```bash  
-torchrun main.py --config path_to_your_config.yaml \
-                 --default-config path_to_your_default_config.yaml \
-                 --nproc_per_node $NUM_NODE --master_port=$PORT
+torchrun --nproc_per_node $NUM_NODE --nnodes 1 \
+         --rdzv_id $JOB_ID --rdzv_backend c10d --rdzv_endpoint localhost:$PORT \
+         main.py --config path_to_your_config.yaml \
+         --default-config path_to_your_default_config.yaml
 ```  
 
 #### Switch to Evaluation Mode  
 To run the evaluation loop, add the `--evaluation` flag to the command line:  
 ```bash  
-torchrun main.py --config path_to_your_config.yaml \
-                 --default-config path_to_your_default_config.yaml \
-                 --nproc_per_node $NUM_NODE --master_port=$PORT \
-                 --evaluation
+torchrun --nproc_per_node $NUM_NODE --nnodes 1 \
+         --rdzv_id $JOB_ID --rdzv_backend c10d --rdzv_endpoint localhost:$PORT \
+         main.py --config path_to_your_config.yaml \
+         --default-config path_to_your_default_config.yaml \
+         --evaluation
 ```  
 
 ---

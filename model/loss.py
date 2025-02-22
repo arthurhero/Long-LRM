@@ -41,10 +41,9 @@ class PerceptualLoss(nn.Module):
         target = (target - self.mean) * scale
         loss = torch.mean(torch.abs(pred - target))
         for i_b, block in enumerate(self.blocks):
-            with torch.no_grad():
-                pred = block(pred)
-                target = block(target)
-                loss += torch.mean(torch.abs(pred - target)) * weights[i_b]
+            pred = block(pred)
+            target = block(target)
+            loss += torch.mean(torch.abs(pred - target)) * weights[i_b]
         loss = loss / scale
         return loss
 

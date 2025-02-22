@@ -11,9 +11,14 @@ from easydict import EasyDict as edict
 from einops import rearrange
 from gsplat import rasterization
 
-from .transformer import TransformerBlock
-from .mamba2 import Mamba2Block
-from .loss import PerceptualLoss
+try:
+    from .transformer import TransformerBlock
+    from .mamba2 import Mamba2Block
+    from .loss import PerceptualLoss
+except:
+    from transformer import TransformerBlock
+    from mamba2 import Mamba2Block
+    from loss import PerceptualLoss
 
 def _init_weights(m):
     if isinstance(m, nn.Linear):
@@ -107,6 +112,9 @@ class GaussianRenderer(torch.autograd.Function):
     @staticmethod
     def render(xyz, feature, scale, rotation, opacity, test_c2w, test_intr, 
                W, H, sh_degree, near_plane, far_plane):
+        opacity = opacity.sigmoid().squeeze(-1)
+        scale = scale.exp()
+        rotation = F.normalize(rotation, p=2, dim=-1)
         test_w2c = test_c2w.float().inverse().unsqueeze(0) # (1, 4, 4)
         test_intr_i = torch.zeros(3, 3).to(test_intr.device)
         test_intr_i[0, 0] = test_intr[0]
@@ -166,7 +174,7 @@ class GaussianRenderer(torch.autograd.Function):
         return xyz.grad, feature.grad, scale.grad, rotation.grad, opacity.grad, None, None, None, None, None, None, None
             
 class LongLRM(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, device):
         super().__init__()
         self.config = config
         input_dim = 9 # RGB + plucker ray
@@ -195,12 +203,15 @@ class LongLRM(nn.Module):
         )
         self.tokenDecoder.apply(_init_weights)
 
+        if config.training.get("perceptual_loss", 0.0) > 0:
+            self.perceptual_loss = PerceptualLoss(device, config)
+
         # use DepthAnything for depth loss
-        if config.training.get("depth_loss", 0.0) > 0:
+        if config.training.get("gaussian_depth_loss", 0.0) > 0:
             try:
                 from model.depth_anything.dpt import DepthAnything
             except:
-                from .depth_anything.dpt import DepthAnything
+                from depth_anything.dpt import DepthAnything
             model_configs = {
                 'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
                 'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
@@ -220,8 +231,11 @@ class LongLRM(nn.Module):
             xyz_i = xyz[i]
             feature_i = feature[i]
             scale_i = scale[i]
+            scale_i = scale_i.exp()
             rotation_i = rotation[i]
+            rotation_i = F.normalize(rotation_i, p=2, dim=-1)
             opacity_i = opacity[i]
+            opacity_i = opacity_i.sigmoid().squeeze(-1)
             test_w2c_i = test_c2ws[i].float().inverse() # (V, 4, 4)
             test_intr_i = torch.zeros(V, 3, 3).to(input_intr.device)
             test_intr_i[:, 0, 0] = test_intr[i, :, 0]
@@ -238,37 +252,29 @@ class LongLRM(nn.Module):
             renderings.append(rendering)
         return torch.stack(renderings, dim=0) # (B, V, H, W, 3)
 
-    def forward(self, 
-                input_images,
-                input_intr,
-                input_c2ws,
-                input_pos_avg_inv=None,
-                scene_scale=None,
-                scene_name=None,
-                test_images=None,
-                test_intr=None,
-                test_c2ws=None,
-                use_checkpoint=True,
-               ):
+    def forward(self, input_dict):
         """
         input_images: (B, V, 3, H, W)
         input_intr: (B, V, 4), (fx, fy, cx, cy)
         input_c2ws: (B, V, 4, 4)
-        input_pos_avg_inv: (B, 4, 4)
+        pos_avg_inv: (B, 4, 4)
         scene_scale: (B)
         """
+        input_dict = edict(input_dict)
+        input_images = input_dict["input_images"]
+        input_intr = input_dict["input_intr"]
+        input_c2ws = input_dict["input_c2ws"]
+        test_images = input_dict.get("test_images", None)
+        test_intr = input_dict.get("test_intr", None)
+        test_c2ws = input_dict.get("test_c2ws", None)
+        pos_avg_inv = input_dict.get("pos_avg_inv", None)
+        scene_scale = input_dict.get("scene_scale", None)
+        scene_name = input_dict.get("scene_name", None)
+        use_checkpoint = input_dict.get("use_checkpoint", True)
+
+
         inference_start = time.time()
         B, V, _, H, W = input_images.shape
-
-        if input_pos_avg_inv is not None:
-            input_c2ws = input_pos_avg_inv.unsqueeze(1) @ input_c2ws # (B, V, 4, 4)
-            if test_c2ws is not None:
-                test_c2ws = input_pos_avg_inv.unsqueeze(1) @ test_c2ws
-
-        if scene_scale is not None:
-            input_c2ws[:, :, :3, 3] = input_c2ws[:, :, :3, 3] * scene_scale.reshape(B, 1, 1)
-            if test_c2ws is not None:
-                test_c2ws[:, :, :3, 3] = test_c2ws[:, :, :3, 3] * scene_scale.reshape(B, 1, 1)
 
         # Embed camera info
         ray_o = input_c2ws[:, :, :3, 3].unsqueeze(2).expand(-1, -1, H * W, -1).float() # (B, V, H*W, 3) # camera origin
@@ -321,7 +327,7 @@ class LongLRM(nn.Module):
             dist = xyz.mean(dim=-1, keepdim=True).sigmoid() * self.config.model.gaussians.max_dist # (B, V*H*W, 1)
             xyz = dist * ray_d.reshape(B, -1, 3) + ray_o.reshape(B, -1, 3) # (B, V*H*W, 3)
             # get pixel-aligned depth before pruning
-            if self.config.training.get("depth_loss", 0.0) > 0:
+            if self.config.training.get("gaussian_depth_loss", 0.0) > 0:
                 pos = xyz.reshape(B, V, H*W, 3)
                 input_w2cs = input_c2ws.float().inverse() # (B, V, 4, 4)
                 pos_cam = pos @ input_w2cs[:, :, :3, :3].transpose(-1, -2).contiguous() + input_w2cs[:, :, :3, 3:4].transpose(-1,-2).contiguous() # (B, V, H*W, 3)
@@ -332,11 +338,11 @@ class LongLRM(nn.Module):
                 disp_pred = (disp_pred - disp_median) / (disp_var + 1e-6)
 
         gaussians = {
-            "xyz": xyz,
-            "feature": feature,
-            "scale": scale,
-            "rotation": rotation,
-            "opacity": opacity
+            "xyz": xyz.float(),
+            "feature": feature.float(),
+            "scale": scale.float(),
+            "rotation": rotation.float(),
+            "opacity": opacity.float()
         }
         inference_time = time.time() - inference_start
 
@@ -370,8 +376,8 @@ class LongLRM(nn.Module):
             "inference_time": inference_time
         }
 
-        if input_pos_avg_inv is not None:
-            ret_dict["pos_avg_inv"] = input_pos_avg_inv
+        if pos_avg_inv is not None:
+            ret_dict["pos_avg_inv"] = pos_avg_inv
 
         if scene_scale is not None:
             ret_dict["scene_scale"] = scene_scale
@@ -383,18 +389,19 @@ class LongLRM(nn.Module):
             return ret_dict
 
         # Render images at test views
-        xyz = gaussians["xyz"].float()
-        feature = gaussians["feature"].float()
-        scale = gaussians["scale"].exp().float()
-        rotation = F.normalize(gaussians["rotation"].float(), p=2, dim=-1)
-        opacity = gaussians["opacity"].sigmoid().squeeze(-1).float()
-        if use_checkpoint:
-            # cannot simply use torch checkpoint as memory reduction relies on the loop through views
-            renderings = GaussianRenderer.apply(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H, 
-                                                self.config.model.gaussians.sh_degree, self.config.model.gaussians.near_plane,
-                                                self.config.model.gaussians.far_plane)
-        else:
-            renderings = self.render(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H) # (B, V, H, W, 3)
+        xyz = gaussians["xyz"]
+        feature = gaussians["feature"]
+        scale = gaussians["scale"]
+        rotation = gaussians["rotation"]
+        opacity = gaussians["opacity"]
+        with torch.autocast(enabled=False, device_type="cuda"):
+            if use_checkpoint:
+                # cannot simply use torch checkpoint as memory reduction relies on the loop through views
+                renderings = GaussianRenderer.apply(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H, 
+                                                    self.config.model.gaussians.sh_degree, self.config.model.gaussians.near_plane,
+                                                    self.config.model.gaussians.far_plane)
+            else:
+                renderings = self.render(xyz, feature, scale, rotation, opacity, test_c2ws, test_intr, W, H) # (B, V, H, W, 3)
         renderings = renderings.permute(0, 1, 4, 2, 3).contiguous() # (B, V, 3, H, W)
         ret_dict["renderings"] = renderings
 
@@ -415,14 +422,14 @@ class LongLRM(nn.Module):
             "psnr": psnr,
         }
         if self.config.training.get("perceptual_loss", 0.0) > 0:
-            perceptual_loss = PerceptualLoss(renderings.device, self.config)(renderings, test_images)
+            perceptual_loss = self.perceptual_loss(renderings, test_images)
             total_loss += perceptual_loss * self.config.training.perceptual_loss
             loss_dict["perceptual_loss"] = perceptual_loss
         if self.config.training.get("opacity_loss", 0.0) > 0:
-            opacity_loss = opacity.mean()
+            opacity_loss = opacity.sigmoid().mean()
             total_loss += opacity_loss * self.config.training.opacity_loss
             loss_dict["opacity_loss"] = opacity_loss
-        if self.config.model.gaussians.get("align_to_pixel", True) and self.config.training.get("depth_loss", 0.0) > 0:
+        if self.config.model.gaussians.get("align_to_pixel", True) and self.config.training.get("gaussian_depth_loss", 0.0) > 0:
             H_ = (H // 14) * 14
             W_ = (W // 14) * 14
             input_images_ = nn.functional.interpolate(input_images.flatten(0, 1), (H_, W_), mode='bilinear') # (B*V, 3, H_, W_)
@@ -434,9 +441,9 @@ class LongLRM(nn.Module):
             disp_var = (disp_da - disp_median).abs().mean(dim=-1, keepdim=True) # (B, V, 1)
             disp_da = (disp_da - disp_median) / (disp_var + 1e-6)
 
-            depth_loss = F.smooth_l1_loss(disp_pred, disp_da)
-            total_loss += depth_loss * self.config.training.depth_loss
-            loss_dict["depth_loss"] = depth_loss
+            gaussian_depth_loss = F.smooth_l1_loss(disp_pred, disp_da)
+            total_loss += gaussian_depth_loss * self.config.training.gaussian_depth_loss
+            loss_dict["gaussian_depth_loss"] = gaussian_depth_loss
 
             ret_dict["disp_da"] = disp_da.reshape(B, V, H, W)
             ret_dict["disp_pred"] = disp_pred.reshape(B, V, H, W)
@@ -523,22 +530,22 @@ class LongLRM(nn.Module):
 
         xyz = gaussian_dict["xyz"].detach().float().to(device) # (N, 3)
         feature = gaussian_dict["feature"].detach().float().to(device) # (N, (sh_degree+1)**2, 3)
-        scale = gaussian_dict["scale"].detach().float().exp().to(device) # (N, 3)
+        scale = gaussian_dict["scale"].detach().float().to(device) # (N, 3)
         rotation = gaussian_dict["rotation"].detach().float().to(device) # (N, 4)
-        rotation = F.normalize(rotation, p=2, dim=-1)
-        opacity = gaussian_dict["opacity"].detach().float().sigmoid().to(device).squeeze(-1) # (N, 1)
+        opacity = gaussian_dict["opacity"].detach().float().to(device).squeeze(-1) # (N, 1)
 
         renderings = []
-        for i in range(V):
-            rendering = GaussianRenderer.render(xyz, feature, scale, rotation, opacity,
-                                                c2ws_mat[i], intr_fxfycxcy[i], W, H,
-                                                self.config.model.gaussians.sh_degree,
-                                                self.config.model.gaussians.near_plane,
-                                                self.config.model.gaussians.far_plane)
-            rendering = rendering.squeeze(0).clamp(0, 1).cpu().numpy() # (H, W, 3)
-            rendering = (rendering * 255).astype(np.uint8)
-            rendering = cv2.cvtColor(rendering, cv2.COLOR_RGB2BGR)
-            renderings.append(rendering)
+        with torch.autocast(enabled=False, device_type="cuda"):
+            for i in range(V):
+                rendering = GaussianRenderer.render(xyz, feature, scale, rotation, opacity,
+                                                    c2ws_mat[i], intr_fxfycxcy[i], W, H,
+                                                    self.config.model.gaussians.sh_degree,
+                                                    self.config.model.gaussians.near_plane,
+                                                    self.config.model.gaussians.far_plane)
+                rendering = rendering.squeeze(0).clamp(0, 1).cpu().numpy() # (H, W, 3)
+                rendering = (rendering * 255).astype(np.uint8)
+                rendering = cv2.cvtColor(rendering, cv2.COLOR_RGB2BGR)
+                renderings.append(rendering)
         tmp_save_path = save_path.replace(".mp4", "_tmp.mp4")
         video_writer = cv2.VideoWriter(tmp_save_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (W, H))
         for r in renderings:
@@ -596,12 +603,6 @@ class LongLRM(nn.Module):
             input_intr = input_dict["input_intr"][0]
             input_c2ws = input_dict["input_c2ws"][0]
             gaussian_first = {k: v[0] for k, v in gaussians.items()}
-            input_pos_avg_inv = input_dict["input_pos_avg_inv"][0] if "input_pos_avg_inv" in input_dict else None
-            scene_scale = input_dict["scene_scale"][0] if "scene_scale" in input_dict else None
-            if input_pos_avg_inv is not None:
-                input_c2ws = input_pos_avg_inv.unsqueeze(0) @ input_c2ws
-            if scene_scale is not None:
-                input_c2ws[:, :3, 3] = input_c2ws[:, :3, 3] * scene_scale
             self.save_input_video(input_intr, input_c2ws, gaussian_first, H, W, os.path.join(save_dir, "input_traj.mp4"),
                                   insert_frame_num=self.config.get("insert_frame_num", 8))
 
@@ -621,6 +622,7 @@ class LongLRM(nn.Module):
             scene_name = input_dict["scene_name"][i]
             scene_dir = os.path.join(save_dir, scene_name)
             os.makedirs(scene_dir, exist_ok=True)
+
             # evaluation metrics
             psnr = compute_psnr(renderings[i], target_images[i]) # (V,)
             ssim = compute_ssim(renderings[i], target_images[i]) # (V,)
@@ -633,6 +635,7 @@ class LongLRM(nn.Module):
                 f.write(f"gaussian_usage, {gaussian_usage[i].item()}\n")
                 f.write(f"inference_time, {inference_time}\n") 
                 f.close()
+
             # save images
             input_images_path = os.path.join(scene_dir, "input_images.png")
             input_image = input_images[i].permute(1, 2, 0, 3).flatten(2, 3) # (3, H, Vin*W)
@@ -644,20 +647,25 @@ class LongLRM(nn.Module):
                 rendering_path = os.path.join(scene_dir, "rendering", f"{j}.png")
                 torchvision.utils.save_image(target_images[i, j], target_path)
                 torchvision.utils.save_image(renderings[i, j], rendering_path)
+
             # save gaussian ply
             gaussian = {k: v[i] for k, v in gaussians.items()}
             opacity_threshold = self.config.model.gaussians.get("opacity_threshold", 0.001)
             self.save_gaussian_ply(gaussian, os.path.join(scene_dir, f"gaussians_{str(opacity_threshold).split('.')[-1]}.ply"), opacity_threshold)
 
+            # save pose normalization info
+            if "pos_avg_inv" in output_dict:
+                pos_avg_inv = input_dict["pos_avg_inv"][i] # (4, 4)
+                pos_avg_inv_path = os.path.join(scene_dir, "pos_avg_inv.txt")
+                np.savetxt(pos_avg_inv_path, pos_avg_inv.cpu().numpy())
+            if "scene_scale" in output_dict:
+                scene_scale = input_dict["scene_scale"][i]
+                scene_scale_path = os.path.join(scene_dir, "scene_scale.txt")
+                np.savetxt(scene_scale_path, np.array([scene_scale.item()])) 
+
             # save input traj video
             input_intr = input_dict["input_intr"][i]
             input_c2ws = input_dict["input_c2ws"][i]
-            input_pos_avg_inv = input_dict["input_pos_avg_inv"][i] if "input_pos_avg_inv" in input_dict else None
-            scene_scale = input_dict["scene_scale"][i] if "scene_scale" in input_dict else None
-            if input_pos_avg_inv is not None:
-                input_c2ws = input_pos_avg_inv.unsqueeze(0) @ input_c2ws
-            if scene_scale is not None:
-                input_c2ws[:, :3, 3] = input_c2ws[:, :3, 3] * scene_scale
             self.save_input_video(input_intr, input_c2ws, gaussian, H, W, os.path.join(scene_dir, "input_traj.mp4"),
                                   insert_frame_num=self.config.get("insert_frame_num", 8))
 
@@ -726,6 +734,7 @@ if __name__ == "__main__":
         },
         "model": {
             "dim": [256, 512, 1024],
+            "patch_size": patch_size,
             "num_layers": 4,
             "block_type": "tmtm",
             "merge_layers": [1,2],
@@ -745,17 +754,21 @@ if __name__ == "__main__":
                 "near_plane": 0.1,
                 "far_plane": 100,
                 "prune_ratio": 0.5,
-                "random_ratio": 0.2,
+                "random_ratio": 0.0,
             },
         },
         "training": {
             "l2_loss": 1.0,
             "perceptual_loss": 0.1,
             "opacity_loss": 0.1,
-            "depth_loss": 0.1
+            "gaussian_depth_loss": 0.0,
+            "perceptual_out_idx": [4],
+            "perceptual_out_weights": [1.0],
+            "perceptual_feature_scale": 1.0,
         }
     })
-    llrm = LongLRM(config).to("cuda")
+    device = "cuda"
+    llrm = LongLRM(config, device).to("cuda")
     input_images = torch.randn(batch_size, view, 3, h, w).to("cuda")
     input_images = nn.Parameter(input_images)
     input_images.retain_grad()
@@ -765,7 +778,7 @@ if __name__ == "__main__":
     input_intr[:, :, 2] = w//2
     input_intr[:, :, 3] = h//2
     input_c2ws = torch.eye(4).unsqueeze(0).expand(batch_size, view, 4, 4).to("cuda")
-    input_pos_avg_inv = torch.eye(4).unsqueeze(0).expand(batch_size, 4, 4).to("cuda")
+    pos_avg_inv = torch.eye(4).unsqueeze(0).expand(batch_size, 4, 4).to("cuda")
     scene_scale = torch.ones(batch_size).to("cuda")
 
     view_test = 256
@@ -777,10 +790,18 @@ if __name__ == "__main__":
     test_c2ws = torch.eye(4).unsqueeze(0).expand(batch_size, view_test, 4, 4).to("cuda")
     test_images = torch.ones(batch_size, view_test, 3, h, w).to("cuda")
 
+    input_dict = {
+        "input_images": input_images,
+        "input_intr": input_intr,
+        "input_c2ws": input_c2ws,
+        "test_images": test_images,
+        "test_intr": test_intr,
+        "test_c2ws": test_c2ws,
+        "checkpoints": True,
+    }
+
     with torch.autocast(enabled=True, device_type="cuda"):
-        ret_dict = llrm(input_images, input_intr, input_c2ws,
-                        input_pos_avg_inv=input_pos_avg_inv, scene_scale=scene_scale,
-                        test_images=test_images, test_intr=test_intr, test_c2ws=test_c2ws, use_checkpoint=True)
+        ret_dict = llrm(input_dict)
     gaussians = ret_dict["gaussians"]
     renderings = ret_dict["renderings"]
     #renderings.mean().backward()
@@ -794,14 +815,23 @@ if __name__ == "__main__":
     print("num_gaussians:", gaussians["xyz"].shape[1])
     print("loss:", loss_dict)
 
-    """
     grad = input_images.grad.clone()
     input_images.grad.zero_()
+    input_dict = {
+        "input_images": input_images,
+        "input_intr": input_intr,
+        "input_c2ws": input_c2ws,
+        "test_images": test_images,
+        "test_intr": test_intr,
+        "test_c2ws": test_c2ws,
+        "checkpoints": False,
+    }
     with torch.autocast(enabled=True, device_type="cuda"):
-        renderings = llrm(input_images, input_intr, input_c2ws,
-                         test_images=None, test_intr=test_intr, test_c2ws=test_c2ws, use_checkpoint=False)
-    renderings.mean().backward()
-    render2 = renderings.clone()
+        ret_dict = llrm(input_dict)
+    render2 = ret_dict["renderings"].clone()
+    loss_dict2 = ret_dict["loss"]
+    loss_total2 = loss_dict2["total_loss"]
+    loss_total2.backward() 
     grad2 = input_images.grad.clone()
     print("Peak memory without checkpoint:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
 
@@ -812,4 +842,4 @@ if __name__ == "__main__":
     diff = (grad - grad2).abs()
     print("Max grad diff:", diff.max())
     print("Norm grad diff:", diff.norm())
-    """
+    print("loss2:", loss_dict2)

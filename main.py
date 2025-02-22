@@ -111,7 +111,7 @@ dataloader = DataLoader(dataset,
                         sampler=datasampler)
 
 # model setup
-model = LongLRM(config).to(device)
+model = LongLRM(config, device).to(device)
 model = DDP(model, device_ids=[local_rank])
 enable_grad_scaler = config.use_amp and config.amp_dtype == "fp16"
 scaler = torch.cuda.amp.GradScaler(enabled=enable_grad_scaler)
@@ -121,9 +121,10 @@ amp_dtype_mapping = {"fp16": torch.float16, "bf16": torch.bfloat16}
 if not config.get("evaluation", False):
     train_steps = config.training.train_steps
     grad_accum_steps = config.training.grad_accum_steps
-    param_update_steps = int(train_steps / grad_accum_steps)
-    total_batch_size = batch_size_per_gpu * world_size
-    num_epochs = int(train_steps * total_batch_size / len(dataset))
+    param_update_steps = train_steps
+    train_steps = train_steps * grad_accum_steps
+    total_batch_size = batch_size_per_gpu * world_size * grad_accum_steps
+    num_epochs = int(param_update_steps * total_batch_size / len(dataset))
     logger.info(f"train_steps: {train_steps}, grad_accum_steps: {grad_accum_steps}, param_update_steps: {param_update_steps}, batch_size_per_gpu: {batch_size_per_gpu}, world_size: {world_size}, batch_size_total: {total_batch_size}, dataset_size: {len(dataset)}, num_epochs: {num_epochs}")
     optimizer = create_optimizer(model, config.training.weight_decay, config.training.lr,
                                 (config.training.beta1, config.training.beta2))
@@ -134,6 +135,7 @@ num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_g
 logger.info(f"Number of parameters: {num_params / 1e6:.2f}M, trainable: {num_trainable_params / 1e6:.2f}M")
 train_steps_done = 0
 resume_file = auto_resume_helper(checkpoint_dir)
+auto_resume = resume_file is not None
 if resume_file is None:
     resume_file = config.training.get('resume_ckpt', None)
 if resume_file is None:
@@ -147,12 +149,15 @@ else:
         status = model.load_state_dict(checkpoint['model'], strict=False)
     logger.info(f"Loaded model with status: {status}")
 
-    if (not config.get("evaluation", False)) and (not config.get("reset_training_state", False)):
+    if (not config.get("evaluation", False)) and (auto_resume or (not config.training.get("reset_training_state", False))): 
         train_steps_done = checkpoint['train_steps_done']
-        logger.info(f"Resume from train_steps_done: {train_steps_done}")
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        logger.info(f"Loaded optimizer and scheduler")
+        logger.info(f"Resume from train_steps_done: {train_steps_done}, param_update_steps_done: {train_steps_done // grad_accum_steps}")
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            logger.info(f"Loaded optimizer and scheduler")
+        except:
+            logger.warning(f"Failed to load optimizer and scheduler, start with new optimizer and scheduler")
 
 # wandb setup
 if rank == 0  and not config.get("evaluation", False):
@@ -212,7 +217,7 @@ if config.get("evaluation", False):
             for key in data.keys():
                 if isinstance(data[key], torch.Tensor):
                     data[key] = data[key].to(device)
-            ret_dict = model(**data)
+            ret_dict = model(data)
             model.module.save_evaluation_results(data, ret_dict, evaluation_dir)
         torch.cuda.empty_cache()
     torch.distributed.barrier()
@@ -261,18 +266,20 @@ if rank == 0 and config.training.get("perceptual_loss", 0.0) > 0:
 torch.distributed.barrier()
 model.train()
 len_dataset = len(dataset) // batch_size_per_gpu * batch_size_per_gpu
-cur_epoch = train_steps_done * total_batch_size // len_dataset
+cur_epoch = train_steps_done * total_batch_size // len_dataset // grad_accum_steps
 datasampler.set_epoch(cur_epoch)
 dataloader_iter = iter(dataloader)
 param_optim_dict = {n: p for n, p in model.named_parameters() if p.requires_grad}
 param_optim_list = [p for p in param_optim_dict.values()]
 train_steps_start = train_steps_done
+param_update_steps_start = train_steps_done // grad_accum_steps
 while train_steps_done <= train_steps:
+    param_update_steps_done = train_steps_done // grad_accum_steps
     try:
         data = next(dataloader_iter)
     except StopIteration:
         #print("We have exhausted the dataloader iterator, resetting it")
-        cur_epoch = train_steps_done * total_batch_size // len_dataset
+        cur_epoch = param_update_steps_done * total_batch_size // len_dataset
         datasampler.set_epoch(cur_epoch)
         dataloader_iter = iter(dataloader)
         data = next(dataloader_iter)
@@ -287,10 +294,12 @@ while train_steps_done <= train_steps:
         device_type="cuda",
         dtype=amp_dtype_mapping[config.amp_dtype],
     )
-    if not update_param:
-        context = model.no_sync(), context
-    with context:
-        ret_dict = model(**data)
+    if update_param:
+        with context:
+            ret_dict = model(data)
+    else:
+        with model.no_sync(), context:
+            ret_dict = model(data)
     torch.cuda.synchronize()
     fwd_end_time = time.time()
     fwd_time = fwd_end_time - start_time
@@ -300,6 +309,7 @@ while train_steps_done <= train_steps:
     total_loss = loss_dict['total_loss']
     scaler.scale(total_loss / grad_accum_steps).backward()
     train_steps_done += 1
+    param_update_steps_done = train_steps_done // grad_accum_steps
 
     skip_optimizer_step = False
     if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -343,19 +353,19 @@ while train_steps_done <= train_steps:
     optim_time_str = f"{optim_time:.2f} s"
 
     # logging and checkpointing
-    if rank == 0:
+    if rank == 0 and update_param:
         gaussian_usage = ret_dict['gaussian_usage'].mean().item()
         loss_dict = {k: v.item() for k, v in loss_dict.items()}
-        if train_steps_done % config.training.print_every == 0 or train_steps_done < train_steps_start + 100:
+        if param_update_steps_done % config.training.print_every == 0 or param_update_steps_done < param_update_steps_start + 100:
             loss_str = ", ".join([f"{k}: {v:.4f}" for k, v in loss_dict.items()])
             loss_str += f", gaussian_usage: {gaussian_usage:.4f}"
             memory_usage = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0
-            logger.info(f"\nStep {train_steps_done} / {train_steps}, Epoch {cur_epoch}\n{loss_str}\nfwd_time: {fwd_time_str}, bwd_time: {bwd_time_str}, optim_time: {optim_time_str}, memory: {memory_usage:.2f} MB")
-        if train_steps_done % config.training.wandb_every == 0 or train_steps_done < train_steps_start + 100:
+            logger.info(f"\nStep {param_update_steps_done} / {train_steps // grad_accum_steps}, Epoch {cur_epoch}\n{loss_str}\nfwd_time: {fwd_time_str}, bwd_time: {bwd_time_str}, optim_time: {optim_time_str}, memory: {memory_usage:.2f} MB")
+        if param_update_steps_done % config.training.wandb_every == 0 or param_update_steps_done < param_update_steps_start + 100:
             log_dict = {
-                "iter": train_steps_done,
-                "train_steps_done": train_steps_done,
-                "param_update_steps": train_steps_done // grad_accum_steps,
+                "iter": param_update_steps_done,
+                "param_update_steps": param_update_steps_done,
+                "train_steps": train_steps_done,
                 "lr": optimizer.param_groups[0]["lr"],
                 "iter_time": time.time() - start_time,
                 "grad_norm": total_grad_norm,
@@ -363,20 +373,20 @@ while train_steps_done <= train_steps:
                 "train/gaussian_usage": gaussian_usage,
             }
             log_dict.update({"train/" + k: v for k, v in loss_dict.items()})
-            wandb.log(log_dict, step = train_steps_done)
-        if train_steps_done % config.training.checkpoint_every == 0 or train_steps_done == train_steps:
+            wandb.log(log_dict, step = param_update_steps_done)
+        if param_update_steps_done % config.training.checkpoint_every == 0 or train_steps_done == train_steps:
             checkpoint = {
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'train_steps_done': train_steps_done,
             }
-            torch.save(checkpoint, os.path.join(checkpoint_dir, f"checkpoint_{train_steps_done:09d}.pt"))
-            logger.info(f"Saved checkpoint at step {train_steps_done}")
-        if train_steps_done % config.training.vis_every == 0 or train_steps_done < train_steps_start + 25:
-            save_gaussian = train_steps_done % config.training.save_gaussian_every == 0
-            save_video = train_steps_done % config.training.save_video_every == 0
-            model.module.save_visualization(data, ret_dict, os.path.join(checkpoint_dir, f"vis_{train_steps_done:09d}"),
+            torch.save(checkpoint, os.path.join(checkpoint_dir, f"checkpoint_{param_update_steps_done:09d}.pt"))
+            logger.info(f"Saved checkpoint at step {param_update_steps_done}")
+        if param_update_steps_done % config.training.vis_every == 0 or param_update_steps_done < param_update_steps_start + 25:
+            save_gaussian = param_update_steps_done % config.training.save_gaussian_every == 0
+            save_video = param_update_steps_done % config.training.save_video_every == 0
+            model.module.save_visualization(data, ret_dict, os.path.join(checkpoint_dir, f"vis_{param_update_steps_done:09d}"),
                                             save_gaussian = save_gaussian, save_video = save_video)
     torch.distributed.barrier()
 torch.distributed.barrier()
