@@ -1,4 +1,5 @@
 # This is a sample config file for training a model on the mydesk dataset at global batch size 32 (on 8 A100 GPUs).
+# It should get around 29 PSNR for evaluation after 8k steps.
 # Remember to switch to 1 GPU for evaluation as there is only 1 scene in this dataset.
 # For training on the DL3DV dataset with 32 input views, use global batch size 256.
 # You can achieve this by setting batch_size_per_gpu or grad_accum_steps, or increasing the number of GPUs. 
