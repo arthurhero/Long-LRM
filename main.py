@@ -98,7 +98,7 @@ if rank == 0:
     logger.info("Data example:\n"+data_desc)
 torch.distributed.barrier()
 
-datasampler = DistributedSampler(dataset)
+datasampler = DistributedSampler(dataset, shuffle=not config.get("evaluation", False))
 batch_size_per_gpu = config.training.batch_size_per_gpu
 dataloader = DataLoader(dataset, 
                         batch_size=batch_size_per_gpu,

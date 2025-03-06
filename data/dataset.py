@@ -110,13 +110,9 @@ class Dataset(Dataset):
                 assert min_frame_dist >= num_input_frames + num_target_frames - 1
             frame_dist = np.random.randint(min_frame_dist, max_frame_dist + 1)
             shuffle_input_prob = self.config.data.get("shuffle_input_prob", 0.0)
-            shuffle_input = False
-            if np.random.rand() < shuffle_input_prob:
-                shuffle_input = True
+            shuffle_input = np.random.rand() < shuffle_input_prob
             reverse_input_prob = self.config.data.get("reverse_input_prob", 0.0)
-            reverse_input = False
-            if np.random.rand() < reverse_input_prob:
-                reverse_input = True
+            reverse_input = np.random.rand() < reverse_input_prob
      
             # get frame range
             start_frame_idx = np.random.randint(0, len(frames) - frame_dist)
