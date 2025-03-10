@@ -551,7 +551,7 @@ class LongLRM(nn.Module):
         for r in renderings:
             video_writer.write(r)
         video_writer.release()
-        subprocess.run(f"ffmpeg -y -i {tmp_save_path} -vcodec libx264 -f mp4 {save_path}", shell=True) 
+        subprocess.run(f"ffmpeg -y -i {tmp_save_path} -vcodec libx264 -f mp4 {save_path} -loglevel quiet", shell=True) 
         os.remove(tmp_save_path)
 
     def save_visualization(self, input_dict, output_dict, save_dir, save_gaussian=False, save_video=False):
@@ -662,6 +662,14 @@ class LongLRM(nn.Module):
                 scene_scale = input_dict["scene_scale"][i]
                 scene_scale_path = os.path.join(scene_dir, "scene_scale.txt")
                 np.savetxt(scene_scale_path, np.array([scene_scale.item()])) 
+            if "input_frame_idx" in input_dict:
+                input_frame_idx = input_dict["input_frame_idx"][i] # (V,)
+                input_frame_idx_path = os.path.join(scene_dir, "input_frame_idx.txt")
+                np.savetxt(input_frame_idx_path, input_frame_idx.cpu().numpy().astype(int), fmt='%i')
+            if "test_frame_idx" in input_dict:
+                target_frame_idx = input_dict["test_frame_idx"][i]
+                target_frame_idx_path = os.path.join(scene_dir, "target_frame_idx.txt")
+                np.savetxt(target_frame_idx_path, target_frame_idx.cpu().numpy().astype(int), fmt='%i')
 
             # save input traj video
             input_intr = input_dict["input_intr"][i]

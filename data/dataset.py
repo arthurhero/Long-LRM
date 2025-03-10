@@ -207,6 +207,8 @@ class Dataset(Dataset):
                 "test_c2ws": target_c2ws,
                 "pos_avg_inv": pos_avg_inv,
                 "scene_scale": scene_scale,
+                "input_frame_idx": torch.tensor(input_frame_idx).long(),
+                "test_frame_idx": torch.tensor(target_frame_idx).long(),
             }
         except:
             traceback.print_exc()
