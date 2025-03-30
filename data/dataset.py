@@ -196,6 +196,14 @@ class Dataset(Dataset):
 
             input_c2ws[:, :3, 3] *= scene_scale
             target_c2ws[:, :3, 3] *= scene_scale
+
+            if torch.isnan(input_c2ws).any() or torch.isinf(input_c2ws).any():
+                print("encounter nan or inf in input poses")
+                assert False
+
+            if torch.isnan(target_c2ws).any() or torch.isinf(target_c2ws).any():
+                print("encounter nan or inf in target poses")
+                assert False
      
             ret_dict = {
                 "scene_name": scene_name,
@@ -212,7 +220,7 @@ class Dataset(Dataset):
             }
         except:
             traceback.print_exc()
-            print(f"error loading")
+            print(f"error loading data: {self.data_path[idx]}")
             return self.__getitem__(random.randint(0, len(self) - 1))
 
         return ret_dict
