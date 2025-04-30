@@ -1,0 +1,26 @@
+data:
+  data_path: "path/to/dl3dv10k.txt"
+  resize_h: 256
+  square_crop: true
+  input_frame_select_type: "uniform"
+  target_frame_select_type: "random"
+  num_input_frames: 32
+  num_target_frames: 8
+  target_has_input: true
+  min_frame_dist: 64
+  max_frame_dist: 128
+  shuffle_input_prob: 0.5
+  reverse_input_prob: 0.5
+
+data_eval:
+  data_path: "path/to/dl3dv140_benchmark.txt"
+  target_frame_select_type: "uniform"
+  target_has_input: false
+  min_frame_dist: 96
+  max_frame_dist: 96
+  shuffle_input_prob: 0.0
+  reverse_input_prob: 0.0
+
+training:
+  batch_size_per_gpu: 4
+  train_steps: 1000000

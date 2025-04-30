@@ -31,12 +31,13 @@ class Dataset(Dataset):
     def __len__(self):
         return len(self.data_path)
 
-    def process_frames(self, frames, image_base_dir):
+    def process_frames(self, frames, image_base_dir, random_crop_ratio=None):
         resize_h = self.config.data.get("resize_h", -1)
         resize_w = self.config.data.get("resize_w", -1)
         patch_size = self.config.model.patch_size
         patch_size = patch_size * 2 ** len(self.config.model.get("merge_layers", [])) 
         square_crop = self.config.data.square_crop
+        random_crop = self.config.data.get("random_crop", 1.0)
 
         images = [Image.open(os.path.join(image_base_dir, frame["file_path"])) for frame in frames]
         images = np.stack([np.array(image) for image in images]) # (num_frames, H, W, 3)
@@ -75,10 +76,23 @@ class Dataset(Dataset):
             intrinsics[:, 3] -= start_h
         intrinsics = torch.from_numpy(intrinsics).float()
 
+        # random crop
+        if random_crop < 1.0:
+            random_crop_ratio = np.random.uniform(random_crop, 1.0) if random_crop_ratio is None else random_crop_ratio
+            magnify_ratio = 1.0 / random_crop_ratio
+            cur_h, cur_w = images.shape[2], images.shape[3]
+            images = F.interpolate(images, scale_factor=magnify_ratio, mode='bilinear', align_corners=False)
+            mag_h, mag_w = images.shape[2], images.shape[3]
+            start_h = (mag_h - cur_h) // 2
+            start_w = (mag_w - cur_w) // 2
+            images = images[:, :, start_h:start_h+cur_h, start_w:start_w+cur_w]
+            intrinsics[:, 0] *= (mag_w / cur_w)
+            intrinsics[:, 1] *= (mag_h / cur_h) 
+
         w2cs = np.stack([np.array(frame["w2c"]) for frame in frames])
         c2ws = np.linalg.inv(w2cs) # (num_frames, 4, 4)
         c2ws = torch.from_numpy(c2ws).float()
-        return images, intrinsics, c2ws
+        return images, intrinsics, c2ws, random_crop_ratio
 
     def __getitem__(self, idx):
         try:
@@ -168,13 +182,14 @@ class Dataset(Dataset):
             if shuffle_input:
                 np.random.shuffle(input_frame_idx)
      
+            random_crop_ratio = None
             target_frames = [frames[i] for i in target_frame_idx]
-            target_images, target_intr, target_c2ws = self.process_frames(target_frames, image_base_dir)
+            target_images, target_intr, target_c2ws, random_crop_ratio = self.process_frames(target_frames, image_base_dir)
      
             input_frames = [frames[i] for i in input_frame_idx]
-            input_images, input_intr, input_c2ws = self.process_frames(input_frames, image_base_dir)
+            input_images, input_intr, input_c2ws, _ = self.process_frames(input_frames, image_base_dir, random_crop_ratio)
      
-            # noramlize input camera poses
+            # normalize input camera poses
             position_avg = input_c2ws[:, :3, 3].mean(0) # (3,)
             forward_avg = input_c2ws[:, :3, 2].mean(0) # (3,)
             down_avg = input_c2ws[:, :3, 1].mean(0) # (3,)

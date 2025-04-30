@@ -1,0 +1,36 @@
+data:
+  data_path: "path/to/dl3dv10k.txt"
+  resize_h: 540
+  square_crop: false
+  input_frame_select_type: "uniform"
+  target_frame_select_type: "random"
+  num_input_frames: 32
+  num_target_frames: 8
+  target_has_input: true
+  min_frame_dist: "all"
+  shuffle_input_prob: 0.5
+  reverse_input_prob: 0.5
+  random_crop: 0.77
+
+data_eval:
+  data_path: "path/to/dl3dv140_benchmark.txt"
+  target_frame_select_type: "uniform_every"
+  target_uniform_every: 8
+  input_frame_select_type: "kmeans"
+  target_has_input: false
+  shuffle_input_prob: 0.0
+  reverse_input_prob: 0.0
+  random_crop: 1.0
+
+training:
+  lr: 0.00004
+  batch_size_per_gpu: 1
+  train_steps: 1000000
+  resume_ckpt: "path/to/stage2/checkpoint"
+  reset_training_state: True
+  warmup_steps: 0
+
+model:
+  gaussians:
+    prune_ratio: 0.6
+    random_ratio: 0.1

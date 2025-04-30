@@ -10,7 +10,7 @@ This repository contains a self-reimplemented version of **Long-LRM**, including
 
 - [x] Sample config files
 - [ ] Script for converting raw DL3DV files into reuqired format
-- [ ] Config files for training on DL3DV
+- [x] Config files for training on DL3DV
 - [ ] 2D GS support
 - [ ] Post-prediction optimization
 - [ ] Pre-trained model weights (please do not count on this)
