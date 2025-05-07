@@ -57,7 +57,9 @@ training:
   perceptual_out_idx: [4, 9, 14, 23, 32]
   perceptual_out_weights: [0.3846, 0.2083, 0.2703, 0.1786, 6.6667]
   perceptual_feature_scale: 255.0
-  # weights from https://www.vlfeat.org/matconvnet/pretrained/
+  # weights converted from https://www.vlfeat.org/matconvnet/pretrained/
+  # in the case of github lfs quota issue, download the converted checkpoint from huggingface
+  # https://huggingface.co/arthurhero/llrm_stuff/resolve/main/misc/matconvnet_vgg19.pt
   perceptual_vgg_weights: "model/matconvnet_vgg19.pt"
   opacity_loss: 0.1
   gaussian_depth_loss: 0.01
