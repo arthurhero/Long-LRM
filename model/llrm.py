@@ -532,7 +532,7 @@ class LongLRM(nn.Module):
         feature = gaussian_dict["feature"].detach().float().to(device) # (N, (sh_degree+1)**2, 3)
         scale = gaussian_dict["scale"].detach().float().to(device) # (N, 3)
         rotation = gaussian_dict["rotation"].detach().float().to(device) # (N, 4)
-        opacity = gaussian_dict["opacity"].detach().float().to(device).squeeze(-1) # (N, 1)
+        opacity = gaussian_dict["opacity"].detach().float().to(device) # (N, 1)
 
         renderings = []
         with torch.autocast(enabled=False, device_type="cuda"):

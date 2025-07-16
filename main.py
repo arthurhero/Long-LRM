@@ -150,8 +150,9 @@ else:
     logger.info(f"Loaded model with status: {status}")
 
     if (not config.get("evaluation", False)) and (auto_resume or (not config.training.get("reset_training_state", False))): 
-        train_steps_done = checkpoint['train_steps_done']
-        logger.info(f"Resume from train_steps_done: {train_steps_done}, param_update_steps_done: {train_steps_done // grad_accum_steps}")
+        param_update_steps_done = checkpoint['param_update_steps_done']
+        train_steps_done = param_update_steps_done * grad_accum_steps
+        logger.info(f"Resume from train_steps_done: {train_steps_done}, param_update_steps_done: {param_update_steps_done}")
         try:
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
@@ -379,7 +380,7 @@ while train_steps_done <= train_steps:
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
-                'train_steps_done': train_steps_done,
+                'param_update_steps_done': param_update_steps_done,
             }
             torch.save(checkpoint, os.path.join(checkpoint_dir, f"checkpoint_{param_update_steps_done:09d}.pt"))
             logger.info(f"Saved checkpoint at step {param_update_steps_done}")
