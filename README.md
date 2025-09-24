@@ -2,7 +2,13 @@
 
 [**Project Page**](https://arthurhero.github.io/projects/llrm/index.html)  
 
-This repository contains a self-reimplemented version of **Long-LRM**, including the model code, as well as training and evaluation pipelines. The reimplemented version has been verified to match the performance of the original implementation.  
+This repository contains a self-reimplemented version of **Long-LRM**, including the model code, as well as training and evaluation pipelines. The reimplemented version has been verified to match the performance of the original implementation.
+
+---
+
+## Updates
+
+We have just released the Long-LRM evaluation results on DL3DV-140 ([download here](https://huggingface.co/arthurhero/llrm_stuff/resolve/main/misc/dl3dv_i540_32input_8target.zip)), including the rendered target views, per-view metrics, and interpolated input trajectory videos, for fellow reearchers to use as a baseline. The model is re-trained with the code in this repository on DL3DV-10K (with DL3DV-140 filtered out) and achieves a mean PSNR of 24.21. Please note that except for the first inference mini-batch, subsequent inference runs complete in about 1 second.
 
 ---
 
@@ -11,9 +17,10 @@ This repository contains a self-reimplemented version of **Long-LRM**, including
 - [x] Sample config files
 - [x] Script for converting raw DL3DV files into reuqired format
 - [x] Config files for training on DL3DV
+- [x] Long-LRM evaluation results on DL3DV-140 for baseline comparison
 - [ ] 2D GS support
 - [ ] Post-prediction optimization
-- [ ] Pre-trained model weights (please do not count on this)
+- [ ] Pre-trained model weights (we are working on it)
 
 ---
 
